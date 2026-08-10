@@ -1,9 +1,6 @@
 --==================================================
--- FTP HUB - PENTEST / DIAGNOSTIC CLIENT
---==================================================
-
---==================================================
--- SERVICES
+-- FTP HUB - REALTIME CLIENT TELEMETRY
+-- Diagnostic / Pentest Lab
 --==================================================
 
 local Players = game:GetService("Players")
@@ -19,565 +16,567 @@ local LocalPlayer = Players.LocalPlayer
 
 local ALLOWED_PLACE_ID = 89469502395769
 
-print("========================================")
-print("        FTP HUB PENTEST STARTING")
-print("========================================")
-print("Current PlaceId :", game.PlaceId)
-print("Expected PlaceId:", ALLOWED_PLACE_ID)
-
 if game.PlaceId ~= ALLOWED_PLACE_ID then
-	warn("[FTP HUB] PlaceId tidak cocok.")
+	warn("[FTP TELEMETRY] Wrong PlaceId:", game.PlaceId)
 	return
 end
-
-print("[FTP HUB] PlaceId verified.")
 
 --==================================================
 -- CONFIG
 --==================================================
 
 local CONFIG = {
-	WelcomeDuration = 8,
+	PositionInterval = 0.25,
+	HealthInterval = 0.10,
+	RemoteScanInterval = 5,
 	Debug = true,
-	ShowDiagnostics = true,
-	ScanRemotes = true,
-	ScanTools = true
+	GUI = true
 }
 
 --==================================================
 -- LOGGER
 --==================================================
 
-local function log(...)
-	print("[FTP HUB]", ...)
+local function timestamp()
+	return os.date("%H:%M:%S")
 end
 
-local function warning(...)
-	warn("[FTP HUB]", ...)
+local function log(eventName, data)
+	print(
+		string.format(
+			"[%s] [FTP] [%s] [%s] %s",
+			timestamp(),
+			LocalPlayer.Name,
+			eventName,
+			tostring(data or "")
+		)
+	)
 end
 
 --==================================================
--- PLAYER
+-- PLAYER STATE
 --==================================================
 
-if not LocalPlayer then
-	warning("LocalPlayer tidak ditemukan.")
-	return
+local character
+local humanoid
+local rootPart
+
+local lastPosition
+local lastHealth
+local lastWalkSpeed
+local lastJumpPower
+
+--==================================================
+-- CHARACTER SETUP
+--==================================================
+
+local function setupCharacter(char)
+
+	character = char
+
+	log(
+		"CHARACTER_CHANGED",
+		char:GetFullName()
+	)
+
+	humanoid = char:FindFirstChildOfClass("Humanoid")
+
+	rootPart = char:FindFirstChild("HumanoidRootPart")
+
+	if not humanoid then
+		log("WARNING", "Humanoid tidak ditemukan")
+		return
+	end
+
+	if not rootPart then
+		log("WARNING", "HumanoidRootPart tidak ditemukan")
+	end
+
+	lastHealth = humanoid.Health
+	lastWalkSpeed = humanoid.WalkSpeed
+	lastJumpPower = humanoid.JumpPower
+
+	if rootPart then
+		lastPosition = rootPart.Position
+	end
+
+	log("CHARACTER", "Humanoid OK")
+
+	log(
+		"STATS",
+		"HP=" .. humanoid.Health ..
+		" MaxHP=" .. humanoid.MaxHealth ..
+		" WalkSpeed=" .. humanoid.WalkSpeed ..
+		" JumpPower=" .. humanoid.JumpPower
+	)
+
+	--==================================================
+	-- HUMANOID STATE
+	--==================================================
+
+	humanoid.StateChanged:Connect(function(oldState, newState)
+
+		log(
+			"STATE",
+			oldState.Name .. " -> " .. newState.Name
+		)
+
+	end)
+
+	--==================================================
+	-- JUMP
+	--==================================================
+
+	humanoid.Jumping:Connect(function(active)
+
+		if active then
+			log("JUMP", "Humanoid.Jumping = true")
+		end
+
+	end)
+
+	--==================================================
+	-- TOOL MONITOR
+	--==================================================
+
+	local function monitorTool(tool)
+
+		if not tool:IsA("Tool") then
+			return
+		end
+
+		log(
+			"TOOL",
+			"Detected: " .. tool.Name
+		)
+
+		tool.Equipped:Connect(function()
+
+			log(
+				"TOOL_EQUIP",
+				tool.Name
+			)
+
+		end)
+
+		tool.Unequipped:Connect(function()
+
+			log(
+				"TOOL_UNEQUIP",
+				tool.Name
+			)
+
+		end)
+
+		tool.Activated:Connect(function()
+
+			log(
+				"TOOL_ACTIVATE",
+				tool.Name
+			)
+
+		end)
+
+		tool.Deactivated:Connect(function()
+
+			log(
+				"TOOL_DEACTIVATE",
+				tool.Name
+			)
+
+		end)
+
+	end
+
+	for _, object in ipairs(char:GetChildren()) do
+		monitorTool(object)
+	end
+
+	char.ChildAdded:Connect(function(object)
+
+		if object:IsA("Tool") then
+			monitorTool(object)
+		end
+
+	end)
+
 end
 
-log("Player:", LocalPlayer.Name)
-log("UserId:", LocalPlayer.UserId)
-
 --==================================================
--- CHARACTER
+-- INITIAL CHARACTER
 --==================================================
 
-local character = LocalPlayer.Character
+setupCharacter(
+	LocalPlayer.Character
 	or LocalPlayer.CharacterAdded:Wait()
+)
 
-local humanoid = character:FindFirstChildOfClass("Humanoid")
-local rootPart = character:FindFirstChild("HumanoidRootPart")
+--==================================================
+-- CHARACTER RESPAWN
+--==================================================
 
-if humanoid then
-	log("Humanoid: OK")
-	log("Health:", humanoid.Health)
-	log("MaxHealth:", humanoid.MaxHealth)
-	log("WalkSpeed:", humanoid.WalkSpeed)
-	log("JumpPower:", humanoid.JumpPower)
-else
-	warning("Humanoid tidak ditemukan.")
-end
+LocalPlayer.CharacterAdded:Connect(function(char)
 
-if rootPart then
-	log("HumanoidRootPart: OK")
-else
-	warning("HumanoidRootPart tidak ditemukan.")
-end
+	task.wait(0.25)
+
+	setupCharacter(char)
+
+end)
+
+--==================================================
+-- BACKPACK TOOL MONITOR
+--==================================================
+
+local backpack = LocalPlayer:WaitForChild("Backpack")
+
+backpack.ChildAdded:Connect(function(object)
+
+	if object:IsA("Tool") then
+
+		log(
+			"TOOL_BACKPACK_ADD",
+			object.Name
+		)
+
+		object.Equipped:Connect(function()
+
+			log(
+				"TOOL_EQUIP",
+				object.Name
+			)
+
+		end)
+
+		object.Unequipped:Connect(function()
+
+			log(
+				"TOOL_UNEQUIP",
+				object.Name
+			)
+
+		end)
+
+	end
+
+end)
+
+backpack.ChildRemoved:Connect(function(object)
+
+	if object:IsA("Tool") then
+
+		log(
+			"TOOL_BACKPACK_REMOVE",
+			object.Name
+		)
+
+	end
+
+end)
+
+--==================================================
+-- POSITION / MOVEMENT MONITOR
+--==================================================
+
+local positionTimer = 0
+
+RunService.Heartbeat:Connect(function(deltaTime)
+
+	if not character or not humanoid then
+		return
+	end
+
+	positionTimer += deltaTime
+
+	if positionTimer < CONFIG.PositionInterval then
+		return
+	end
+
+	positionTimer = 0
+
+	if rootPart then
+
+		local position = rootPart.Position
+
+		if lastPosition then
+
+			local distance =
+				(position - lastPosition).Magnitude
+
+			if distance > 0.01 then
+
+				log(
+					"POSITION",
+					string.format(
+						"X=%.2f Y=%.2f Z=%.2f Δ=%.2f",
+						position.X,
+						position.Y,
+						position.Z,
+						distance
+					)
+				)
+
+			end
+
+		end
+
+		lastPosition = position
+
+	end
+
+	--==================================================
+	-- WALKSPEED
+	--==================================================
+
+	if humanoid.WalkSpeed ~= lastWalkSpeed then
+
+		log(
+			"WALKSPEED_CHANGED",
+			string.format(
+				"%.2f -> %.2f",
+				lastWalkSpeed,
+				humanoid.WalkSpeed
+			)
+		)
+
+		lastWalkSpeed = humanoid.WalkSpeed
+
+	end
+
+	--==================================================
+	-- JUMPPOWER
+	--==================================================
+
+	if humanoid.JumpPower ~= lastJumpPower then
+
+		log(
+			"JUMPPOWER_CHANGED",
+			string.format(
+				"%.2f -> %.2f",
+				lastJumpPower,
+				humanoid.JumpPower
+			)
+		)
+
+		lastJumpPower = humanoid.JumpPower
+
+	end
+
+	--==================================================
+	-- HEALTH
+	--==================================================
+
+	if humanoid.Health ~= lastHealth then
+
+		log(
+			"HEALTH_CHANGED",
+			string.format(
+				"%.2f -> %.2f",
+				lastHealth,
+				humanoid.Health
+			)
+		)
+
+		lastHealth = humanoid.Health
+
+	end
+
+end)
+
+--==================================================
+-- KEYBOARD INPUT
+--==================================================
+
+UserInputService.InputBegan:Connect(function(input, processed)
+
+	local inputType = input.UserInputType
+
+	if inputType == Enum.UserInputType.Keyboard then
+
+		log(
+			"KEY_DOWN",
+			tostring(input.KeyCode)
+		)
+
+	elseif inputType == Enum.UserInputType.MouseButton1 then
+
+		log(
+			"MOUSE_DOWN",
+			"Left"
+		)
+
+	elseif inputType == Enum.UserInputType.MouseButton2 then
+
+		log(
+			"MOUSE_DOWN",
+			"Right"
+		)
+
+	elseif inputType == Enum.UserInputType.MouseButton3 then
+
+		log(
+			"MOUSE_DOWN",
+			"Middle"
+		)
+
+	end
+
+end)
+
+--==================================================
+-- INPUT END
+--==================================================
+
+UserInputService.InputEnded:Connect(function(input)
+
+	local inputType = input.UserInputType
+
+	if inputType == Enum.UserInputType.Keyboard then
+
+		log(
+			"KEY_UP",
+			tostring(input.KeyCode)
+		)
+
+	elseif inputType == Enum.UserInputType.MouseButton1 then
+
+		log(
+			"MOUSE_UP",
+			"Left"
+		)
+
+	elseif inputType == Enum.UserInputType.MouseButton2 then
+
+		log(
+			"MOUSE_UP",
+			"Right"
+		)
+
+	end
+
+end)
+
+--==================================================
+-- INPUT CHANGE
+--==================================================
+
+UserInputService.InputChanged:Connect(function(input)
+
+	if input.UserInputType == Enum.UserInputType.MouseMovement then
+
+		log(
+			"MOUSE_MOVE",
+			string.format(
+				"X=%d Y=%d",
+				input.Position.X,
+				input.Position.Y
+			)
+		)
+
+	end
+
+end)
 
 --==================================================
 -- REMOTE SCANNER
 --==================================================
 
-local remoteResults = {}
-
 local function scanRemotes()
 
-	table.clear(remoteResults)
+	local folder =
+		ReplicatedStorage:FindFirstChild("Remotes")
 
-	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+	if not folder then
 
-	if not remotes then
-		warning("Folder 'Remotes' tidak ditemukan.")
-		return nil
+		log(
+			"REMOTE_SCAN",
+			"ReplicatedStorage.Remotes tidak ditemukan"
+		)
+
+		return
+
 	end
 
-	log("Remotes ditemukan:", remotes:GetFullName())
+	log(
+		"REMOTE_SCAN",
+		"Scanning " .. folder:GetFullName()
+	)
 
-	for _, object in ipairs(remotes:GetDescendants()) do
+	for _, object in ipairs(folder:GetDescendants()) do
 
 		if object:IsA("RemoteEvent") then
 
-			table.insert(remoteResults, {
-				Name = object.Name,
-				Class = "RemoteEvent",
-				Path = object:GetFullName()
-			})
-
 			log(
-				"[RemoteEvent]",
+				"REMOTE_EVENT",
 				object:GetFullName()
 			)
 
 		elseif object:IsA("RemoteFunction") then
 
-			table.insert(remoteResults, {
-				Name = object.Name,
-				Class = "RemoteFunction",
-				Path = object:GetFullName()
-			})
-
 			log(
-				"[RemoteFunction]",
+				"REMOTE_FUNCTION",
 				object:GetFullName()
 			)
 
 		end
+
 	end
 
-	return remotes
 end
 
-local remotes = nil
-
-if CONFIG.ScanRemotes then
-	remotes = scanRemotes()
-end
+scanRemotes()
 
 --==================================================
--- KNOWN REMOTE CHECK
+-- PERIODIC REMOTE SCAN
 --==================================================
 
-local knownRemoteNames = {
-	"DamageEvent",
-	"HealEvent",
-	"RespawnEvent",
-	"DamageEffect"
-}
+task.spawn(function()
 
-local knownRemoteStatus = {}
+	while true do
 
-if remotes then
+		task.wait(CONFIG.RemoteScanInterval)
 
-	for _, name in ipairs(knownRemoteNames) do
+		scanRemotes()
 
-		local object = remotes:FindFirstChild(name)
-
-		if object then
-
-			knownRemoteStatus[name] = true
-
-			log(
-				"[FOUND]",
-				name,
-				"-",
-				object.ClassName
-			)
-
-		else
-
-			knownRemoteStatus[name] = false
-
-			warning(
-				"[MISSING]",
-				name
-			)
-
-		end
-	end
-end
-
---==================================================
--- TOOL / WEAPON SCANNER
---==================================================
-
-local tools = {}
-
-local function scanTools()
-
-	table.clear(tools)
-
-	local backpack = LocalPlayer:FindFirstChild("Backpack")
-
-	if backpack then
-
-		for _, object in ipairs(backpack:GetChildren()) do
-
-			if object:IsA("Tool") then
-
-				table.insert(tools, object.Name)
-
-				log(
-					"[BACKPACK TOOL]",
-					object.Name
-				)
-
-			end
-		end
 	end
 
-	if character then
-
-		for _, object in ipairs(character:GetChildren()) do
-
-			if object:IsA("Tool") then
-
-				table.insert(tools, object.Name)
-
-				log(
-					"[EQUIPPED TOOL]",
-					object.Name
-				)
-
-			end
-		end
-	end
-end
-
-if CONFIG.ScanTools then
-	scanTools()
-end
+end)
 
 --==================================================
--- GUI
+-- CHARACTER PROPERTY WATCH
 --==================================================
 
-local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+task.spawn(function()
 
-local oldGui = playerGui:FindFirstChild("FTPHub")
-
-if oldGui then
-	oldGui:Destroy()
-end
-
-local gui = Instance.new("ScreenGui")
-
-gui.Name = "FTPHub"
-gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = false
-gui.Parent = playerGui
-
---==================================================
--- MAIN FRAME
---==================================================
-
-local frame = Instance.new("Frame")
-
-frame.Name = "Main"
-frame.Size = UDim2.fromOffset(560, 250)
-frame.Position = UDim2.new(0.5, -280, 0, 35)
-
-frame.BackgroundColor3 = Color3.fromRGB(8, 8, 8)
-frame.BackgroundTransparency = 0.05
-
-frame.BorderSizePixel = 0
-frame.Parent = gui
-
-local corner = Instance.new("UICorner")
-
-corner.CornerRadius = UDim.new(0, 14)
-corner.Parent = frame
-
-local stroke = Instance.new("UIStroke")
-
-stroke.Color = Color3.fromRGB(0, 255, 0)
-stroke.Thickness = 2
-
-stroke.Parent = frame
-
---==================================================
--- TITLE
---==================================================
-
-local title = Instance.new("TextLabel")
-
-title.Name = "Title"
-
-title.Size = UDim2.new(1, -20, 0, 65)
-title.Position = UDim2.fromOffset(10, 10)
-
-title.BackgroundTransparency = 1
-
-title.Text = "WELCOME TO FTP HUB"
-
-title.TextColor3 =
-	Color3.fromRGB(0, 255, 0)
-
-title.Font = Enum.Font.Code
-title.TextScaled = true
-
-title.Parent = frame
-
---==================================================
--- STATUS
---==================================================
-
-local status = Instance.new("TextLabel")
-
-status.Name = "Status"
-
-status.Size = UDim2.new(1, -20, 0, 35)
-status.Position = UDim2.fromOffset(10, 78)
-
-status.BackgroundTransparency = 1
-
-status.Text =
-	"● PENTEST MODE  |  PLACE VERIFIED"
-
-status.TextColor3 =
-	Color3.fromRGB(100, 255, 100)
-
-status.Font = Enum.Font.Code
-status.TextScaled = true
-
-status.Parent = frame
-
---==================================================
--- INFO
---==================================================
-
-local info = Instance.new("TextLabel")
-
-info.Name = "Info"
-
-info.Size = UDim2.new(1, -40, 0, 90)
-info.Position = UDim2.fromOffset(20, 125)
-
-info.BackgroundTransparency = 1
-
-info.TextXAlignment = Enum.TextXAlignment.Left
-info.TextYAlignment = Enum.TextYAlignment.Top
-
-info.TextColor3 =
-	Color3.fromRGB(200, 200, 200)
-
-info.Font = Enum.Font.Code
-info.TextSize = 16
-
-info.Text =
-	"PlaceId : " .. tostring(game.PlaceId)
-	.. "\nPlayer  : " .. LocalPlayer.Name
-	.. "\nRemotes : " .. tostring(#remoteResults)
-	.. "\nTools   : " .. tostring(#tools)
-
-info.Parent = frame
-
---==================================================
--- CLOSE BUTTON
---==================================================
-
-local closeButton = Instance.new("TextButton")
-
-closeButton.Name = "Close"
-
-closeButton.Size = UDim2.fromOffset(32, 32)
-closeButton.Position = UDim2.new(1, -42, 0, 10)
-
-closeButton.BackgroundColor3 =
-	Color3.fromRGB(30, 30, 30)
-
-closeButton.Text = "X"
-
-closeButton.TextColor3 =
-	Color3.fromRGB(255, 80, 80)
-
-closeButton.Font = Enum.Font.Code
-closeButton.TextSize = 18
-
-closeButton.Parent = frame
-
-local closeCorner = Instance.new("UICorner")
-
-closeCorner.CornerRadius = UDim.new(0, 8)
-closeCorner.Parent = closeButton
-
-closeButton.MouseButton1Click:Connect(
-	function()
-
-		gui:Destroy()
-
-	end
-)
-
---==================================================
--- DRAG SYSTEM
---==================================================
-
-local dragging = false
-local dragStart
-local startPosition
-
-local function updateDrag(input)
-
-	local delta =
-		input.Position - dragStart
-
-	frame.Position = UDim2.new(
-		startPosition.X.Scale,
-		startPosition.X.Offset + delta.X,
-		startPosition.Y.Scale,
-		startPosition.Y.Offset + delta.Y
-	)
-end
-
-title.InputBegan:Connect(
-	function(input)
-
-		if input.UserInputType ==
-			Enum.UserInputType.MouseButton1 then
-
-			dragging = true
-
-			dragStart = input.Position
-			startPosition = frame.Position
-
-		end
-	end
-)
-
-title.InputEnded:Connect(
-	function(input)
-
-		if input.UserInputType ==
-			Enum.UserInputType.MouseButton1 then
-
-			dragging = false
-
-		end
-	end
-)
-
-UserInputService.InputChanged:Connect(
-	function(input)
-
-		if dragging and
-			input.UserInputType ==
-			Enum.UserInputType.MouseMovement then
-
-			updateDrag(input)
-
-		end
-
-	end
-)
-
---==================================================
--- CHARACTER UPDATE
---==================================================
-
-LocalPlayer.CharacterAdded:Connect(
-	function(newCharacter)
-
-		character = newCharacter
+	while true do
 
 		task.wait(0.5)
 
-		humanoid =
-			character:FindFirstChildOfClass(
-				"Humanoid"
-			)
+		if character then
 
-		rootPart =
-			character:FindFirstChild(
-				"HumanoidRootPart"
-			)
+			local children = character:GetChildren()
 
-		if humanoid then
 			log(
-				"Character respawned.",
-				"Health:",
-				humanoid.Health
+				"CHARACTER_SCAN",
+				"Children=" .. #children
 			)
-		end
 
-		if CONFIG.ScanTools then
-			scanTools()
-		end
-	end
-)
-
---==================================================
--- PERIODIC STATUS
---==================================================
-
-local heartbeatConnection
-
-heartbeatConnection =
-	RunService.Heartbeat:Connect(
-		function()
-
-			if not gui or not gui.Parent then
-
-				if heartbeatConnection then
-					heartbeatConnection:Disconnect()
-				end
-
-				return
-			end
-
-			if humanoid then
-
-				local currentHealth =
-					math.floor(humanoid.Health)
-
-				local maxHealth =
-					math.floor(humanoid.MaxHealth)
-
-				status.Text =
-					"● PENTEST MODE  |  HP "
-					.. currentHealth
-					.. "/"
-					.. maxHealth
-
-			end
-		end
-	)
-
---==================================================
--- FINAL REPORT
---==================================================
-
-print("========================================")
-print("        FTP HUB DIAGNOSTIC READY")
-print("========================================")
-
-print("PlaceId verified :", game.PlaceId)
-print("Player           :", LocalPlayer.Name)
-print("Remote count     :", #remoteResults)
-print("Tool count       :", #tools)
-
-for name, found in pairs(knownRemoteStatus) do
-
-	print(
-		name,
-		"=",
-		found and "FOUND" or "MISSING"
-	)
-
-end
-
-print("========================================")
-
---==================================================
--- AUTO REMOVE
---==================================================
-
-task.delay(
-	CONFIG.WelcomeDuration,
-	function()
-
-		if gui and gui.Parent then
-			gui:Destroy()
 		end
 
 	end
+
+end)
+
+--==================================================
+-- START
+--==================================================
+
+print("========================================")
+print("FTP HUB REALTIME TELEMETRY READY")
+print("Player :", LocalPlayer.Name)
+print("Place  :", game.PlaceId)
+print("========================================")
+
+log(
+	"START",
+	"Realtime telemetry aktif"
 )
