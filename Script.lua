@@ -2,11 +2,33 @@
 -- FTP HUB - ROBLOX SERVER SCRIPT
 --==================================================
 
--- Services
+--==================================================
+-- SERVICES
+--==================================================
+
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+--==================================================
+-- GAME LOCK
+--==================================================
+
+local ALLOWED_PLACE_ID = 89469502395769
+
+print("================================")
+print("FTP HUB STARTING")
+print("Current PlaceId:", game.PlaceId)
+print("Required PlaceId:", ALLOWED_PLACE_ID)
+print("================================")
+
+if game.PlaceId ~= ALLOWED_PLACE_ID then
+	warn("FTP HUB: Game tidak sesuai.")
+	return
+end
+
+print("FTP HUB: Game terverifikasi.")
 
 --==================================================
 -- MAIN CONFIGURATION
@@ -24,11 +46,34 @@ local CONFIG = {
 -- REMOTES
 --==================================================
 
-local remotes = ReplicatedStorage:WaitForChild("Remotes")
+local remotes = ReplicatedStorage:FindFirstChild("Remotes")
 
-local damageEvent = remotes:WaitForChild("DamageEvent")
-local healEvent = remotes:WaitForChild("HealEvent")
-local respawnEvent = remotes:WaitForChild("RespawnEvent")
+if not remotes then
+	warn("FTP HUB: Folder 'Remotes' tidak ditemukan di ReplicatedStorage.")
+	return
+end
+
+local damageEvent = remotes:FindFirstChild("DamageEvent")
+local healEvent = remotes:FindFirstChild("HealEvent")
+local respawnEvent = remotes:FindFirstChild("RespawnEvent")
+local damageEffect = remotes:FindFirstChild("DamageEffect")
+
+if not damageEvent then
+	warn("FTP HUB: DamageEvent tidak ditemukan.")
+	return
+end
+
+if not healEvent then
+	warn("FTP HUB: HealEvent tidak ditemukan.")
+	return
+end
+
+if not respawnEvent then
+	warn("FTP HUB: RespawnEvent tidak ditemukan.")
+	return
+end
+
+print("FTP HUB: RemoteEvent berhasil ditemukan.")
 
 --==================================================
 -- WEAPON DEFINITIONS
@@ -65,7 +110,7 @@ local function createWelcomeGUI(player)
 
 	local playerGui = player:WaitForChild("PlayerGui")
 
-	-- Hapus GUI lama jika ada
+	-- Hapus GUI lama
 	local oldGui = playerGui:FindFirstChild("FTPHubGui")
 
 	if oldGui then
@@ -77,12 +122,14 @@ local function createWelcomeGUI(player)
 
 	screenGui.Name = "FTPHubGui"
 	screenGui.ResetOnSpawn = false
+	screenGui.IgnoreGuiInset = false
 	screenGui.Parent = playerGui
 
 	-- Main frame
 	local frame = Instance.new("Frame")
 
 	frame.Name = "WelcomeFrame"
+
 	frame.Size = UDim2.new(0, 500, 0, 90)
 	frame.Position = UDim2.new(0.5, -250, 0, 40)
 
@@ -147,7 +194,7 @@ local function calculateDamage(baseDamage, distance, player)
 
 	local modifier = 1
 
-	-- Damage falloff berdasarkan jarak
+	-- Damage falloff
 	if distance > 10 then
 
 		modifier = modifier *
@@ -155,7 +202,7 @@ local function calculateDamage(baseDamage, distance, player)
 
 	end
 
-	-- Random damage variation
+	-- Random variation 90% - 110%
 	modifier = modifier *
 	(math.random() * 0.2 + 0.9)
 
@@ -168,28 +215,56 @@ end
 
 local function setupPlayer(player)
 
+	if not player or not player.Parent then
+		return
+	end
+
 	local character =
 		player.Character
 		or player.CharacterAdded:Wait()
 
+	if not character then
+		return
+	end
+
 	local humanoid =
 		character:WaitForChild("Humanoid")
 
-	-- Player configuration
+	--==================================================
+	-- PLAYER CONFIGURATION
+	--==================================================
+
 	humanoid.WalkSpeed = CONFIG.speed
 	humanoid.JumpPower = CONFIG.jumpPower
 
 	humanoid.MaxHealth = CONFIG.maxHealth
 	humanoid.Health = CONFIG.maxHealth
 
-	-- Welcome GUI
+	--==================================================
+	-- WELCOME GUI
+	--==================================================
+
 	createWelcomeGUI(player)
 
 	--==================================================
 	-- DAMAGE EVENT
 	--==================================================
 
-	damageEvent.OnServerEvent:Connect(
+	-- Cegah setup yang sama membuat koneksi berulang
+	local connectionFolder =
+		player:FindFirstChild("FTP_HUB_CONNECTIONS")
+
+	if connectionFolder then
+		return
+	end
+
+	connectionFolder = Instance.new("Folder")
+	connectionFolder.Name = "FTP_HUB_CONNECTIONS"
+	connectionFolder.Parent = player
+
+	local damageConnection
+
+	damageConnection = damageEvent.OnServerEvent:Connect(
 		function(
 			playerWhoFired,
 			targetPlayer,
@@ -197,7 +272,7 @@ local function setupPlayer(player)
 			weaponIndex
 		)
 
-			-- Pastikan event berasal dari player yang benar
+			-- Pastikan event berasal dari player ini
 			if playerWhoFired ~= player then
 				return
 			end
@@ -207,39 +282,58 @@ local function setupPlayer(player)
 				return
 			end
 
+			if not targetPlayer:IsA("Player") then
+				return
+			end
+
 			if not targetPlayer.Character then
 				return
 			end
 
-			-- Pilih weapon
-			local weapon =
-				weapons[weaponIndex or 1]
+			-- Weapon
+			local index = tonumber(weaponIndex) or 1
+
+			local weapon = weapons[index]
 
 			if not weapon then
 				return
 			end
 
-			-- Cari humanoid target
+			-- Target humanoid
 			local targetHumanoid =
-				targetPlayer.Character:FindFirstChild("Humanoid")
+				targetPlayer.Character:FindFirstChildOfClass(
+					"Humanoid"
+				)
 
 			if not targetHumanoid then
 				return
 			end
 
-			-- Cari PrimaryPart attacker
-			local attackerRoot =
-				player.Character.PrimaryPart
+			if targetHumanoid.Health <= 0 then
+				return
+			end
 
-			-- Cari PrimaryPart target
+			-- Attacker root
+			if not player.Character then
+				return
+			end
+
+			local attackerRoot =
+				player.Character:FindFirstChild(
+					"HumanoidRootPart"
+				)
+
+			-- Target root
 			local targetRoot =
-				targetPlayer.Character.PrimaryPart
+				targetPlayer.Character:FindFirstChild(
+					"HumanoidRootPart"
+				)
 
 			if not attackerRoot or not targetRoot then
 				return
 			end
 
-			-- Hitung jarak
+			-- Distance
 			local playerPosition =
 				attackerRoot.Position
 
@@ -250,40 +344,92 @@ local function setupPlayer(player)
 				(playerPosition - targetPosition).Magnitude
 
 			-- Range check
-			if distance <= weapon.range then
+			if distance > weapon.range then
+				return
+			end
 
-				-- Hitung damage
-				local finalDamage =
-					calculateDamage(
-						damageAmount or weapon.damage,
-						distance,
-						targetPlayer
-					)
+			-- Damage
+			local requestedDamage =
+				tonumber(damageAmount)
 
-				-- Kurangi HP
-				targetHumanoid.Health =
-					math.max(
-						0,
-						targetHumanoid.Health - finalDamage
-					)
+			local baseDamage
 
-				-- Kirim efek damage ke target
-				local damageEffect =
-					remotes:FindFirstChild("DamageEffect")
+			if requestedDamage then
+				baseDamage = requestedDamage
+			else
+				baseDamage = weapon.damage
+			end
 
-				if damageEffect then
+			local finalDamage =
+				calculateDamage(
+					baseDamage,
+					distance,
+					targetPlayer
+				)
 
-					damageEffect:FireClient(
-						targetPlayer,
-						finalDamage
-					)
+			if finalDamage <= 0 then
+				return
+			end
 
+			-- Apply damage
+			targetHumanoid.Health =
+				math.max(
+					0,
+					targetHumanoid.Health - finalDamage
+				)
+
+			-- Client damage effect
+			if damageEffect then
+
+				damageEffect:FireClient(
+					targetPlayer,
+					finalDamage
+				)
+
+			end
+
+			if CONFIG.debugMode then
+
+				print(
+					"[FTP HUB]",
+					player.Name,
+					"hit",
+					targetPlayer.Name,
+					"with",
+					weapon.name,
+					"for",
+					finalDamage,
+					"damage"
+				)
+
+			end
+
+		end
+	)
+
+	-- Simpan connection
+	local objectValue = Instance.new("ObjectValue")
+	objectValue.Name = "DamageConnection"
+	objectValue.Parent = connectionFolder
+
+	--==================================================
+	-- CLEANUP
+	--==================================================
+
+	player.AncestryChanged:Connect(
+		function(_, parent)
+
+			if parent == nil then
+
+				if damageConnection then
+					damageConnection:Disconnect()
 				end
 
 			end
 
 		end
 	)
+
 end
 
 --==================================================
@@ -294,7 +440,13 @@ for _, player in ipairs(
 	Players:GetPlayers()
 ) do
 
-	setupPlayer(player)
+	task.spawn(
+		function()
+
+			setupPlayer(player)
+
+		end
+	)
 
 end
 
@@ -306,6 +458,42 @@ Players.PlayerAdded:Connect(
 	function(player)
 
 		setupPlayer(player)
+
+		-- Setup ulang ketika character respawn
+		player.CharacterAdded:Connect(
+			function(character)
+
+				task.wait(0.5)
+
+				if not player.Parent then
+					return
+				end
+
+				local humanoid =
+					character:FindFirstChildOfClass(
+						"Humanoid"
+					)
+
+				if humanoid then
+
+					humanoid.WalkSpeed =
+						CONFIG.speed
+
+					humanoid.JumpPower =
+						CONFIG.jumpPower
+
+					humanoid.MaxHealth =
+						CONFIG.maxHealth
+
+					humanoid.Health =
+						CONFIG.maxHealth
+
+				end
+
+				createWelcomeGUI(player)
+
+			end
+		)
 
 	end
 )
@@ -327,14 +515,16 @@ RunService.Heartbeat:Connect(
 			if character then
 
 				local humanoid =
-					character:FindFirstChild("Humanoid")
+					character:FindFirstChildOfClass(
+						"Humanoid"
+					)
 
 				if humanoid then
 
 					-- Player mati
 					if humanoid.Health <= 0 then
 
-						-- Cek apakah sedang respawn
+						-- Cek respawning marker
 						if not character:FindFirstChild(
 							"Respawning"
 						) then
@@ -348,7 +538,7 @@ RunService.Heartbeat:Connect(
 							respawning.Parent =
 								character
 
-							-- Delay respawn
+							-- Respawn delay
 							task.delay(
 								CONFIG.respawnTime,
 								function()
@@ -386,6 +576,7 @@ if CONFIG.debugMode then
 
 	print("================================")
 	print("FTP HUB SERVER INITIALIZED")
+	print("PlaceId:", game.PlaceId)
 	print("Players:", #Players:GetPlayers())
 	print("Weapons:", #weapons)
 	print("================================")
