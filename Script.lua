@@ -1,1622 +1,864 @@
---==================================================
--- FTP HUB - PENTEST / DIAGNOSTIC CLIENT
--- REALTIME ACTIVITY MONITOR + SERVICE CLASSIFIER
---==================================================
+--[[
+================================================================
+  KICK A LUCKY BLOCK — AUTO FARM HUB  (v1.0)
+================================================================
+  Self-contained: tidak butuh library luar (Rayfield/Kavo dll).
+  Executor: Delta / Wave / Krnl / Synapse / Xeno (butuh
+            hookmetamethod + firetouchinterest untuk fitur penuh,
+            tapi tetap jalan tanpa itu dengan mode Teleport).
 
---==================================================
--- SERVICES
---==================================================
+  CARA PAKAI SINGKAT:
+   1. Execute script ini di dalam game.
+   2. Klik tombol [SPY: OFF] -> jadi ON.
+   3. Kick 1 lucky block secara MANUAL.
+   4. Buka console executor (F9 / tombol Console).
+      Akan muncul baris: [SPY] Path:FireServer(args...)
+   5. Copy nama remote itu ke CONFIG.KickRemote di bawah,
+      lalu execute ulang. (Opsional — Auto Kick tetap bisa
+      jalan pakai fallback tanpa langkah ini.)
+   6. Nyalakan toggle yang mau dipakai.
+================================================================
+]]
 
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
+--================================================================
+-- 0. GUARD (biar tidak dobel kalau di-execute 2x)
+--================================================================
+if getgenv then
+    if getgenv().KALB_LOADED then
+        local old = getgenv().KALB_CLEANUP
+        if typeof(old) == "function" then pcall(old) end
+    end
+    getgenv().KALB_LOADED = true
+end
+
+--================================================================
+-- 1. SERVICES
+--================================================================
+local Players            = game:GetService("Players")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local Workspace          = game:GetService("Workspace")
+local RunService         = game:GetService("RunService")
+local UserInputService   = game:GetService("UserInputService")
+local VirtualUser        = game:GetService("VirtualUser")
+local StarterGui         = game:GetService("StarterGui")
 
 local LocalPlayer = Players.LocalPlayer
 
---==================================================
--- GAME LOCK
---==================================================
-
-local ALLOWED_PLACE_ID = 89469502395769
-
-print("========================================")
-print("       FTP HUB DIAGNOSTIC STARTING")
-print("========================================")
-print("Current PlaceId  :", game.PlaceId)
-print("Expected PlaceId :", ALLOWED_PLACE_ID)
-print("========================================")
-
-if game.PlaceId ~= ALLOWED_PLACE_ID then
-	warn("[FTP HUB] PlaceId tidak cocok.")
-	return
-end
-
-print("[FTP HUB] PlaceId verified.")
-
---==================================================
--- CONFIG
---==================================================
-
+--================================================================
+-- 2. CONFIG  <-- edit bagian ini
+--================================================================
 local CONFIG = {
-	MaxLogs = 250,
-	PositionInterval = 0.25,
-	WelcomeDuration = 8,
+    -- Toggle (bisa diubah dari UI juga)
+    AutoKick        = false,
+    AutoCollect     = false,
+    AutoRebirth     = false,
+    AutoUpgrade     = false,
+    AntiAFK         = true,
+    NoClipFall      = true,   -- anti jatuh / anti void saat teleport
 
-	Debug = true,
-	ScanRemotes = true,
-	ScanTools = true,
+    -- Metode kick
+    UseTeleport     = true,   -- true = TP ke block, false = tetap di tempat
+    KickDelay       = 0.15,   -- jeda antar kick (detik). Jangan < 0.05
+    CollectDelay    = 0.10,
+    RebirthDelay    = 1.00,
+    UpgradeDelay    = 0.50,
+    RescanInterval  = 3.00,   -- refresh daftar block (detik)
+    ScanRadius      = 500,    -- studs, 0 = tanpa batas
 
-	LOGO_ASSET = "rbxassetid://6031094678"
+    -- Nama remote (isi dari hasil SPY, kosongkan = pakai auto-detect)
+    KickRemote      = "",     -- contoh: "KickBlock"
+    RebirthRemote   = "",     -- contoh: "Rebirth"
+    UpgradeRemote   = "",     -- contoh: "BuyUpgrade"
+
+    -- Argumen remote. Pakai "$BLOCK" sebagai placeholder instance block.
+    -- Contoh dari spy: FireServer(game.Workspace.Blocks.LuckyBlock)
+    --   -> KickArgs = { "$BLOCK" }
+    -- Contoh: FireServer("Kick", 1)  -> KickArgs = { "Kick", 1 }
+    KickArgs        = { "$BLOCK" },
+    RebirthArgs     = { },
+    UpgradeArgs     = { },    -- contoh: { "Power" }
+
+    -- Kata kunci pencarian objek di Workspace
+    BlockKeywords   = { "luckyblock", "lucky", "block", "crate", "box" },
+    DropKeywords    = { "coin", "cash", "money", "gem", "drop", "orb", "pickup" },
 }
 
---==================================================
--- LOGGER
---==================================================
-
+--================================================================
+-- 3. UTIL
+--================================================================
 local function log(...)
-	print("[FTP HUB]", ...)
+    local parts = {}
+    for i = 1, select("#", ...) do
+        parts[#parts + 1] = tostring(select(i, ...))
+    end
+    print("[KALB] " .. table.concat(parts, " "))
 end
 
-local function warning(...)
-	warn("[FTP HUB]", ...)
+local function notify(text, dur)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title    = "Kick a Lucky Block",
+            Text     = tostring(text),
+            Duration = dur or 3,
+        })
+    end)
+    log(text)
 end
 
---==================================================
--- PLAYER
---==================================================
-
-if not LocalPlayer then
-	warning("LocalPlayer tidak ditemukan.")
-	return
+-- loop yang tidak mati kalau ada error
+local function loopTask(getEnabled, getDelay, body)
+    task.spawn(function()
+        while getgenv and getgenv().KALB_LOADED do
+            if getEnabled() then
+                local ok, err = pcall(body)
+                if not ok then log("err:", err) end
+                task.wait(getDelay())
+            else
+                task.wait(0.25)
+            end
+        end
+    end)
 end
 
-log("Player:", LocalPlayer.Name)
-log("UserId:", LocalPlayer.UserId)
-
---==================================================
--- CHARACTER
---==================================================
-
-local character
-local humanoid
-local rootPart
-
-local function refreshCharacter()
-
-	character = LocalPlayer.Character
-
-	if not character then
-		return
-	end
-
-	humanoid =
-		character:FindFirstChildOfClass("Humanoid")
-
-	rootPart =
-		character:FindFirstChild("HumanoidRootPart")
+local function hasKeyword(name, list)
+    local n = string.lower(name)
+    for _, k in ipairs(list) do
+        if string.find(n, k, 1, true) then return true end
+    end
+    return false
 end
 
-character =
-	LocalPlayer.Character
-	or LocalPlayer.CharacterAdded:Wait()
+--================================================================
+-- 4. CHARACTER HELPER
+--================================================================
+local function getChar()
+    local c = LocalPlayer.Character
+    if c and c.Parent then return c end
+    return nil
+end
 
-refreshCharacter()
+local function getHRP()
+    local c = getChar()
+    return c and c:FindFirstChild("HumanoidRootPart") or nil
+end
 
---==================================================
--- SERVICE CLASSIFIER
---==================================================
+local function getHum()
+    local c = getChar()
+    return c and c:FindFirstChildOfClass("Humanoid") or nil
+end
 
-local SERVICE = {
-	PLAYER = "PlayerService",
-	CHARACTER = "CharacterService",
-	MOVEMENT = "MovementService",
-	HEALTH = "HealthService",
-	INPUT = "InputService",
-	TOOL = "ToolService",
-	REMOTE = "RemoteService",
-	SYSTEM = "DiagnosticService"
+local savedCFrame = nil
+
+local function savePos()
+    local hrp = getHRP()
+    if hrp and not savedCFrame then savedCFrame = hrp.CFrame end
+end
+
+local function restorePos()
+    local hrp = getHRP()
+    if hrp and savedCFrame then
+        hrp.CFrame = savedCFrame
+        savedCFrame = nil
+    end
+end
+
+local function tpTo(cf)
+    local hrp = getHRP()
+    if not hrp then return false end
+    local hum = getHum()
+    if CONFIG.NoClipFall and hum then
+        hum:ChangeState(Enum.HumanoidStateType.Physics)
+    end
+    hrp.CFrame = cf
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    return true
+end
+
+--================================================================
+-- 5. REMOTE INDEX + AUTO DETECT
+--================================================================
+local function indexRemotes()
+    local out = {}
+    local roots = { ReplicatedStorage, LocalPlayer, Workspace }
+    for _, root in ipairs(roots) do
+        local ok, desc = pcall(function() return root:GetDescendants() end)
+        if ok then
+            for _, obj in ipairs(desc) do
+                if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction")
+                or obj:IsA("UnreliableRemoteEvent") then
+                    out[#out + 1] = obj
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- cari remote: exact name dulu, kalau tidak ada baru fuzzy by keyword
+local function findRemote(exactName, keywords)
+    local all = indexRemotes()
+    if exactName and exactName ~= "" then
+        for _, r in ipairs(all) do
+            if r.Name == exactName then return r end
+        end
+        for _, r in ipairs(all) do
+            if string.lower(r.Name) == string.lower(exactName) then return r end
+        end
+    end
+    if keywords then
+        for _, r in ipairs(all) do
+            if hasKeyword(r.Name, keywords) then return r end
+        end
+    end
+    return nil
+end
+
+local remoteCache = {}
+
+local function getRemote(slot, exactName, keywords)
+    local cached = remoteCache[slot]
+    if cached and cached.Parent then return cached end
+    local r = findRemote(exactName, keywords)
+    remoteCache[slot] = r
+    if r then log("remote[" .. slot .. "] =", r:GetFullName()) end
+    return r
+end
+
+local function buildArgs(template, block)
+    local args = {}
+    for i, v in ipairs(template) do
+        if v == "$BLOCK" then
+            args[i] = block
+        elseif v == "$BLOCKNAME" then
+            args[i] = block and block.Name or ""
+        else
+            args[i] = v
+        end
+    end
+    return args
+end
+
+local function fireRemote(remote, args)
+    if not remote then return false end
+    local ok = pcall(function()
+        if remote:IsA("RemoteFunction") then
+            remote:InvokeServer(table.unpack(args))
+        else
+            remote:FireServer(table.unpack(args))
+        end
+    end)
+    return ok
+end
+
+--================================================================
+-- 6. REMOTE SPY (untuk menemukan nama remote yang benar)
+--================================================================
+local Spy = { enabled = false, seen = {}, hooked = false }
+
+local function fmtArgs(...)
+    local out = {}
+    for i = 1, select("#", ...) do
+        local v = select(i, ...)
+        local t = typeof(v)
+        if t == "Instance" then
+            out[#out + 1] = v:GetFullName()
+        elseif t == "string" then
+            out[#out + 1] = '"' .. v .. '"'
+        elseif t == "table" then
+            out[#out + 1] = "{table}"
+        else
+            out[#out + 1] = tostring(v)
+        end
+    end
+    return table.concat(out, ", ")
+end
+
+local function initSpy()
+    if Spy.hooked then return true end
+    if not (hookmetamethod and getnamecallmethod) then
+        notify("Executor tidak support hookmetamethod — Spy nonaktif")
+        return false
+    end
+    local oldNamecall
+    oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+        if Spy.enabled then
+            local method = getnamecallmethod()
+            if method == "FireServer" or method == "InvokeServer" then
+                local ok, path = pcall(function() return self:GetFullName() end)
+                if ok then
+                    local key = path .. "|" .. method
+                    if not Spy.seen[key] then
+                        Spy.seen[key] = true
+                        log(string.format("[SPY] %s:%s(%s)", path, method, fmtArgs(...)))
+                    end
+                end
+            end
+        end
+        return oldNamecall(self, ...)
+    end)
+    Spy.hooked = true
+    return true
+end
+
+--================================================================
+-- 7. TARGET FINDER (lucky block & drop)
+--================================================================
+local blockCache, dropCache = {}, {}
+
+local function pivotOf(obj)
+    if obj:IsA("BasePart") then return obj.CFrame end
+    if obj:IsA("Model") then
+        local ok, cf = pcall(function() return obj:GetPivot() end)
+        if ok then return cf end
+    end
+    return nil
+end
+
+local function primaryOf(obj)
+    if obj:IsA("BasePart") then return obj end
+    if obj:IsA("Model") then
+        return obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
+    end
+    return nil
+end
+
+-- scan Workspace, ambil yang match keyword & masih hidup
+local function scanTargets()
+    local blocks, drops = {}, {}
+    local ok, desc = pcall(function() return Workspace:GetDescendants() end)
+    if not ok then return blocks, drops end
+
+    local char = getChar()
+    for _, obj in ipairs(desc) do
+        if (obj:IsA("Model") or obj:IsA("BasePart"))
+        and not (char and obj:IsDescendantOf(char))
+        and not Players:GetPlayerFromCharacter(obj) then
+            if hasKeyword(obj.Name, CONFIG.BlockKeywords) then
+                -- skip kalau ini child dari block lain yang sudah dicatat
+                if primaryOf(obj) then blocks[#blocks + 1] = obj end
+            elseif hasKeyword(obj.Name, CONFIG.DropKeywords) then
+                if primaryOf(obj) then drops[#drops + 1] = obj end
+            end
+        end
+    end
+    return blocks, drops
+end
+
+local function nearest(list)
+    local hrp = getHRP()
+    if not hrp then return nil end
+    local origin = hrp.Position
+    local best, bestDist = nil, math.huge
+    for _, obj in ipairs(list) do
+        if obj.Parent then
+            local cf = pivotOf(obj)
+            if cf then
+                local d = (cf.Position - origin).Magnitude
+                if d < bestDist and (CONFIG.ScanRadius <= 0 or d <= CONFIG.ScanRadius) then
+                    best, bestDist = obj, d
+                end
+            end
+        end
+    end
+    return best, bestDist
+end
+
+-- refresh cache di background
+task.spawn(function()
+    while getgenv and getgenv().KALB_LOADED do
+        local ok, b, d = pcall(scanTargets)
+        if ok then blockCache, dropCache = b, d end
+        task.wait(CONFIG.RescanInterval)
+    end
+end)
+
+--================================================================
+-- 8. AKSI
+--================================================================
+local function tryTouch(targetPart)
+    local hrp = getHRP()
+    if not (hrp and targetPart and firetouchinterest) then return false end
+    local ok = pcall(function()
+        firetouchinterest(hrp, targetPart, 0)
+        task.wait()
+        firetouchinterest(hrp, targetPart, 1)
+    end)
+    return ok
+end
+
+local function tryPrompt(obj)
+    if not fireproximityprompt then return false end
+    local prompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+    if not prompt then return false end
+    return pcall(function() fireproximityprompt(prompt) end)
+end
+
+-- Urutan usaha: Remote -> ProximityPrompt -> Touch -> Teleport
+local function kickBlock(block)
+    if not (block and block.Parent) then return false end
+    local part = primaryOf(block)
+
+    local remote = getRemote("kick", CONFIG.KickRemote,
+        { "kick", "hitblock", "punch", "damageblock", "clickblock" })
+    if remote and fireRemote(remote, buildArgs(CONFIG.KickArgs, block)) then
+        return true
+    end
+
+    if tryPrompt(block) then return true end
+    if part and tryTouch(part) then return true end
+
+    if CONFIG.UseTeleport then
+        local cf = pivotOf(block)
+        if cf then
+            savePos()
+            return tpTo(cf * CFrame.new(0, 3, 0))
+        end
+    end
+    return false
+end
+
+local function collectDrop(drop)
+    if not (drop and drop.Parent) then return false end
+    local part = primaryOf(drop)
+    if part and tryTouch(part) then return true end
+    if tryPrompt(drop) then return true end
+    if CONFIG.UseTeleport then
+        local cf = pivotOf(drop)
+        if cf then
+            savePos()
+            return tpTo(cf)
+        end
+    end
+    return false
+end
+
+local function doRebirth()
+    local remote = getRemote("rebirth", CONFIG.RebirthRemote,
+        { "rebirth", "prestige", "reset", "ascend" })
+    return fireRemote(remote, buildArgs(CONFIG.RebirthArgs, nil))
+end
+
+local function doUpgrade()
+    local remote = getRemote("upgrade", CONFIG.UpgradeRemote,
+        { "upgrade", "buyupgrade", "buy", "purchase", "kickpower", "power" })
+    return fireRemote(remote, buildArgs(CONFIG.UpgradeArgs, nil))
+end
+
+--================================================================
+-- 9. LOOPS
+--================================================================
+loopTask(
+    function() return CONFIG.AutoKick end,
+    function() return CONFIG.KickDelay end,
+    function()
+        local block = nearest(blockCache)
+        if block then
+            kickBlock(block)
+        else
+            -- cache kosong: paksa rescan cepat
+            local ok, b, d = pcall(scanTargets)
+            if ok then blockCache, dropCache = b, d end
+        end
+    end
+)
+
+loopTask(
+    function() return CONFIG.AutoCollect end,
+    function() return CONFIG.CollectDelay end,
+    function()
+        local drop = nearest(dropCache)
+        if drop then collectDrop(drop) end
+    end
+)
+
+loopTask(
+    function() return CONFIG.AutoRebirth end,
+    function() return CONFIG.RebirthDelay end,
+    doRebirth
+)
+
+loopTask(
+    function() return CONFIG.AutoUpgrade end,
+    function() return CONFIG.UpgradeDelay end,
+    doUpgrade
+)
+
+-- balikin posisi kalau semua auto dimatikan
+task.spawn(function()
+    while getgenv and getgenv().KALB_LOADED do
+        if not (CONFIG.AutoKick or CONFIG.AutoCollect) and savedCFrame then
+            restorePos()
+        end
+        task.wait(1)
+    end
+end)
+
+--================================================================
+-- 10. ANTI-AFK
+--================================================================
+local afkConn = LocalPlayer.Idled:Connect(function()
+    if not CONFIG.AntiAFK then return end
+    pcall(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end)
+end)
+
+--================================================================
+-- 11. UI
+--================================================================
+local COL = {
+    bg     = Color3.fromRGB(22, 22, 28),
+    bar    = Color3.fromRGB(32, 32, 40),
+    off    = Color3.fromRGB(48, 48, 58),
+    on     = Color3.fromRGB(64, 176, 110),
+    text   = Color3.fromRGB(235, 235, 240),
+    accent = Color3.fromRGB(120, 150, 255),
 }
 
---==================================================
--- REMOTE SCANNER
---==================================================
-
-local remoteResults = {}
-
-local function scanRemotes()
-
-	table.clear(remoteResults)
-
-	local remotes =
-		ReplicatedStorage:FindFirstChild("Remotes")
-
-	if not remotes then
-
-		warning(
-			"Folder 'Remotes' tidak ditemukan."
-		)
-
-		return nil
-	end
-
-	log(
-		"Remotes ditemukan:",
-		remotes:GetFullName()
-	)
-
-	for _, object in ipairs(
-		remotes:GetDescendants()
-	) do
-
-		if object:IsA("RemoteEvent") then
-
-			table.insert(
-				remoteResults,
-				{
-					Name = object.Name,
-					Class = "RemoteEvent",
-					Path = object:GetFullName()
-				}
-			)
-
-			log(
-				"[RemoteEvent]",
-				object:GetFullName()
-			)
-
-		elseif object:IsA("RemoteFunction") then
-
-			table.insert(
-				remoteResults,
-				{
-					Name = object.Name,
-					Class = "RemoteFunction",
-					Path = object:GetFullName()
-				}
-			)
-
-			log(
-				"[RemoteFunction]",
-				object:GetFullName()
-			)
-		end
-	end
-
-	return remotes
+local function round(inst, px)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, px or 6)
+    c.Parent = inst
+    return c
 end
-
-local remotes = nil
-
-if CONFIG.ScanRemotes then
-	remotes = scanRemotes()
-end
-
---==================================================
--- TOOL SCANNER
---==================================================
-
-local tools = {}
-
-local function scanTools()
-
-	table.clear(tools)
-
-	local backpack =
-		LocalPlayer:FindFirstChild("Backpack")
-
-	if backpack then
-
-		for _, object in ipairs(
-			backpack:GetChildren()
-		) do
-
-			if object:IsA("Tool") then
-
-				table.insert(
-					tools,
-					object.Name
-				)
-
-			end
-		end
-	end
-
-	if character then
-
-		for _, object in ipairs(
-			character:GetChildren()
-		) do
-
-			if object:IsA("Tool") then
-
-				table.insert(
-					tools,
-					object.Name
-				)
-
-			end
-		end
-	end
-end
-
-if CONFIG.ScanTools then
-	scanTools()
-end
-
---==================================================
--- GUI CLEANUP
---==================================================
-
-local playerGui =
-	LocalPlayer:WaitForChild("PlayerGui")
-
-local oldGui =
-	playerGui:FindFirstChild("FTPHub")
-
-if oldGui then
-	oldGui:Destroy()
-end
-
---==================================================
--- SCREEN GUI
---==================================================
 
 local gui = Instance.new("ScreenGui")
+gui.Name             = "KALB_Hub"
+gui.ResetOnSpawn     = false
+gui.IgnoreGuiInset   = true
+gui.ZIndexBehavior   = Enum.ZIndexBehavior.Sibling
+gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+if syn and syn.protect_gui then pcall(syn.protect_gui, gui) end
 
-gui.Name = "FTPHub"
-gui.ResetOnSpawn = false
-gui.IgnoreGuiInset = false
-gui.DisplayOrder = 999
-gui.Parent = playerGui
+local main = Instance.new("Frame")
+main.Size             = UDim2.fromOffset(260, 372)
+main.Position         = UDim2.new(0, 24, 0.5, -186)
+main.BackgroundColor3 = COL.bg
+main.BorderSizePixel  = 0
+main.Active           = true
+main.Parent           = gui
+round(main, 10)
 
---==================================================
--- LOGO BUTTON
---==================================================
+local stroke = Instance.new("UIStroke")
+stroke.Color        = Color3.fromRGB(60, 60, 75)
+stroke.Thickness     = 1
+stroke.Parent        = main
 
-local logoButton =
-	Instance.new("ImageButton")
+local bar = Instance.new("Frame")
+bar.Size             = UDim2.new(1, 0, 0, 34)
+bar.BackgroundColor3 = COL.bar
+bar.BorderSizePixel  = 0
+bar.Parent           = main
+round(bar, 10)
 
-logoButton.Name = "HorseLogo"
-
-logoButton.Size =
-	UDim2.fromOffset(58, 58)
-
-logoButton.Position =
-	UDim2.new(
-		0,
-		15,
-		0.5,
-		-29
-	)
-
-logoButton.BackgroundColor3 =
-	Color3.fromRGB(8, 8, 8)
-
-logoButton.BorderSizePixel = 0
-
-logoButton.Image =
-	CONFIG.LOGO_ASSET
-
-logoButton.ScaleType =
-	Enum.ScaleType.Fit
-
-logoButton.Visible = false
-
-logoButton.Parent = gui
-
-local logoCorner =
-	Instance.new("UICorner")
-
-logoCorner.CornerRadius =
-	UDim.new(1, 0)
-
-logoCorner.Parent =
-	logoButton
-
-local logoStroke =
-	Instance.new("UIStroke")
-
-logoStroke.Color =
-	Color3.fromRGB(0, 255, 0)
-
-logoStroke.Thickness = 2
-
-logoStroke.Parent =
-	logoButton
-
---==================================================
--- MAIN FRAME
---==================================================
-
-local frame =
-	Instance.new("Frame")
-
-frame.Name = "Main"
-
-frame.Size =
-	UDim2.new(
-		0.9,
-		0,
-		0.75,
-		0
-	)
-
-frame.Position =
-	UDim2.new(
-		0.05,
-		0,
-		0.12,
-		0
-	)
-
-frame.BackgroundColor3 =
-	Color3.fromRGB(8, 8, 8)
-
-frame.BackgroundTransparency =
-	0.03
-
-frame.BorderSizePixel = 0
-
-frame.Parent = gui
-
-local frameCorner =
-	Instance.new("UICorner")
-
-frameCorner.CornerRadius =
-	UDim.new(0, 14)
-
-frameCorner.Parent =
-	frame
-
-local frameStroke =
-	Instance.new("UIStroke")
-
-frameStroke.Color =
-	Color3.fromRGB(0, 255, 0)
-
-frameStroke.Thickness = 2
-
-frameStroke.Parent =
-	frame
-
---==================================================
--- TITLE BAR
---==================================================
-
-local titleBar =
-	Instance.new("Frame")
-
-titleBar.Name = "TitleBar"
-
-titleBar.Size =
-	UDim2.new(
-		1,
-		0,
-		0,
-		55
-	)
-
-titleBar.BackgroundTransparency = 1
-
-titleBar.Parent =
-	frame
-
-local title =
-	Instance.new("TextLabel")
-
-title.Size =
-	UDim2.new(
-		1,
-		-70,
-		1,
-		0
-	)
-
-title.Position =
-	UDim2.fromOffset(
-		12,
-		0
-	)
-
+local title = Instance.new("TextLabel")
+title.Size                = UDim2.new(1, -70, 1, 0)
+title.Position            = UDim2.fromOffset(12, 0)
 title.BackgroundTransparency = 1
+title.Font                = Enum.Font.GothamBold
+title.TextSize            = 13
+title.TextColor3          = COL.text
+title.TextXAlignment      = Enum.TextXAlignment.Left
+title.Text                = "Lucky Block · Auto"
+title.Parent              = bar
 
-title.Text =
-	"FTP HUB // REALTIME DIAGNOSTIC"
+local minBtn = Instance.new("TextButton")
+minBtn.Size                = UDim2.fromOffset(28, 22)
+minBtn.Position            = UDim2.new(1, -64, 0, 6)
+minBtn.BackgroundColor3    = COL.off
+minBtn.BorderSizePixel     = 0
+minBtn.Font                = Enum.Font.GothamBold
+minBtn.TextSize            = 14
+minBtn.TextColor3          = COL.text
+minBtn.Text                = "–"
+minBtn.Parent              = bar
+round(minBtn, 5)
 
-title.TextColor3 =
-	Color3.fromRGB(
-		0,
-		255,
-		0
-	)
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size             = UDim2.fromOffset(28, 22)
+closeBtn.Position         = UDim2.new(1, -32, 0, 6)
+closeBtn.BackgroundColor3 = Color3.fromRGB(180, 64, 64)
+closeBtn.BorderSizePixel  = 0
+closeBtn.Font             = Enum.Font.GothamBold
+closeBtn.TextSize         = 12
+closeBtn.TextColor3       = COL.text
+closeBtn.Text             = "X"
+closeBtn.Parent           = bar
+round(closeBtn, 5)
 
-title.Font =
-	Enum.Font.Code
+local body = Instance.new("ScrollingFrame")
+body.Size                 = UDim2.new(1, -16, 1, -46)
+body.Position             = UDim2.fromOffset(8, 40)
+body.BackgroundTransparency = 1
+body.BorderSizePixel      = 0
+body.ScrollBarThickness   = 3
+body.CanvasSize           = UDim2.new()
+body.AutomaticCanvasSize  = Enum.AutomaticSize.Y
+body.Parent               = main
 
-title.TextScaled = true
+local list = Instance.new("UIListLayout")
+list.Padding             = UDim.new(0, 6)
+list.SortOrder           = Enum.SortOrder.LayoutOrder
+list.Parent              = body
 
-title.TextXAlignment =
-	Enum.TextXAlignment.Left
+local function addToggle(label, key, onChange)
+    local btn = Instance.new("TextButton")
+    btn.Size             = UDim2.new(1, 0, 0, 30)
+    btn.BackgroundColor3 = CONFIG[key] and COL.on or COL.off
+    btn.BorderSizePixel  = 0
+    btn.Font             = Enum.Font.Gotham
+    btn.TextSize         = 12
+    btn.TextColor3       = COL.text
+    btn.Text             = string.format("%s : %s", label, CONFIG[key] and "ON" or "OFF")
+    btn.Parent           = body
+    round(btn, 6)
 
-title.Parent =
-	titleBar
+    btn.MouseButton1Click:Connect(function()
+        CONFIG[key] = not CONFIG[key]
+        btn.BackgroundColor3 = CONFIG[key] and COL.on or COL.off
+        btn.Text = string.format("%s : %s", label, CONFIG[key] and "ON" or "OFF")
+        if onChange then pcall(onChange, CONFIG[key]) end
+    end)
+    return btn
+end
 
---==================================================
--- CLOSE BUTTON
---==================================================
+local function addButton(label, fn)
+    local btn = Instance.new("TextButton")
+    btn.Size             = UDim2.new(1, 0, 0, 28)
+    btn.BackgroundColor3 = COL.accent
+    btn.BorderSizePixel  = 0
+    btn.Font             = Enum.Font.GothamMedium
+    btn.TextSize         = 12
+    btn.TextColor3       = Color3.fromRGB(15, 15, 20)
+    btn.Text             = label
+    btn.Parent           = body
+    round(btn, 6)
+    btn.MouseButton1Click:Connect(function() pcall(fn, btn) end)
+    return btn
+end
 
-local closeButton =
-	Instance.new("TextButton")
+local function addSlider(label, key, min, max, step)
+    local holder = Instance.new("Frame")
+    holder.Size                 = UDim2.new(1, 0, 0, 40)
+    holder.BackgroundColor3     = COL.off
+    holder.BorderSizePixel      = 0
+    holder.Parent               = body
+    round(holder, 6)
 
-closeButton.Name = "Close"
+    local txt = Instance.new("TextLabel")
+    txt.Size                    = UDim2.new(1, -12, 0, 16)
+    txt.Position                = UDim2.fromOffset(8, 3)
+    txt.BackgroundTransparency  = 1
+    txt.Font                    = Enum.Font.Gotham
+    txt.TextSize                = 11
+    txt.TextColor3              = COL.text
+    txt.TextXAlignment          = Enum.TextXAlignment.Left
+    txt.Text                    = string.format("%s: %.2f", label, CONFIG[key])
+    txt.Parent                  = holder
 
-closeButton.Size =
-	UDim2.fromOffset(
-		38,
-		38
-	)
+    local track = Instance.new("Frame")
+    track.Size                  = UDim2.new(1, -16, 0, 6)
+    track.Position              = UDim2.fromOffset(8, 24)
+    track.BackgroundColor3      = Color3.fromRGB(70, 70, 84)
+    track.BorderSizePixel       = 0
+    track.Parent                = holder
+    round(track, 3)
 
-closeButton.Position =
-	UDim2.new(
-		1,
-		-47,
-		0,
-		8
-	)
+    local fill = Instance.new("Frame")
+    fill.Size                   = UDim2.fromScale((CONFIG[key] - min) / (max - min), 1)
+    fill.BackgroundColor3       = COL.accent
+    fill.BorderSizePixel        = 0
+    fill.Parent                 = track
+    round(fill, 3)
 
-closeButton.BackgroundColor3 =
-	Color3.fromRGB(
-		30,
-		30,
-		30
-	)
+    local sliding = false
+    local function setFromX(x)
+        local rel = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+        local val = min + rel * (max - min)
+        val = math.floor(val / step + 0.5) * step
+        CONFIG[key] = val
+        fill.Size = UDim2.fromScale((val - min) / (max - min), 1)
+        txt.Text = string.format("%s: %.2f", label, val)
+    end
 
-closeButton.Text = "X"
+    track.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            sliding = true
+            setFromX(i.Position.X)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            sliding = false
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if sliding and (i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch) then
+            setFromX(i.Position.X)
+        end
+    end)
+end
 
-closeButton.TextColor3 =
-	Color3.fromRGB(
-		255,
-		80,
-		80
-	)
+local function addLabel(text)
+    local lb = Instance.new("TextLabel")
+    lb.Size                    = UDim2.new(1, 0, 0, 18)
+    lb.BackgroundTransparency  = 1
+    lb.Font                    = Enum.Font.GothamBold
+    lb.TextSize                = 10
+    lb.TextColor3              = Color3.fromRGB(140, 140, 160)
+    lb.TextXAlignment          = Enum.TextXAlignment.Left
+    lb.Text                    = string.upper(text)
+    lb.Parent                  = body
+    return lb
+end
 
-closeButton.Font =
-	Enum.Font.Code
+-- ==== isi UI ====
+addLabel("Farming")
+addToggle("Auto Kick Block", "AutoKick")
+addToggle("Auto Collect Drop", "AutoCollect")
+addToggle("Auto Rebirth", "AutoRebirth")
+addToggle("Auto Upgrade", "AutoUpgrade")
 
-closeButton.TextSize = 20
+addLabel("Setting")
+addToggle("Teleport Mode", "UseTeleport")
+addToggle("Anti AFK", "AntiAFK")
+addSlider("Kick Delay", "KickDelay", 0.05, 1.0, 0.05)
+addSlider("Scan Radius", "ScanRadius", 0, 1000, 50)
 
-closeButton.Parent =
-	titleBar
+addLabel("Tools")
+local spyBtn
+spyBtn = addButton("Remote Spy : OFF", function()
+    if not Spy.enabled then
+        if not initSpy() then return end
+        Spy.seen = {}
+        Spy.enabled = true
+        spyBtn.Text = "Remote Spy : ON"
+        notify("Spy ON — kick 1 block manual, cek console (F9)")
+    else
+        Spy.enabled = false
+        spyBtn.Text = "Remote Spy : OFF"
+        notify("Spy OFF")
+    end
+end)
 
-local closeCorner =
-	Instance.new("UICorner")
+addButton("List Semua Remote", function()
+    local all = indexRemotes()
+    log("=== " .. #all .. " remote ditemukan ===")
+    for _, r in ipairs(all) do log(" •", r.ClassName, r:GetFullName()) end
+    notify(#all .. " remote di-print ke console")
+end)
 
-closeCorner.CornerRadius =
-	UDim.new(0, 8)
+addButton("List Target Terdeteksi", function()
+    local b, d = scanTargets()
+    log("=== blocks:", #b, "| drops:", #d, "===")
+    local seenB, seenD = {}, {}
+    for _, o in ipairs(b) do seenB[o.Name] = (seenB[o.Name] or 0) + 1 end
+    for _, o in ipairs(d) do seenD[o.Name] = (seenD[o.Name] or 0) + 1 end
+    for n, c in pairs(seenB) do log("  block:", n, "x" .. c) end
+    for n, c in pairs(seenD) do log("  drop :", n, "x" .. c) end
+    notify(("%d block / %d drop"):format(#b, #d))
+end)
 
-closeCorner.Parent =
-	closeButton
+addButton("Kick Sekali (test)", function()
+    local block = nearest(blockCache)
+    if not block then
+        local ok, bb = pcall(scanTargets)
+        if ok then blockCache = bb end
+        block = nearest(blockCache)
+    end
+    if block then
+        notify("test kick: " .. block.Name)
+        kickBlock(block)
+    else
+        notify("tidak ada block terdeteksi")
+    end
+end)
 
---==================================================
--- STATUS
---==================================================
+addButton("Balik ke Posisi Awal", function()
+    restorePos()
+    notify("posisi direstore")
+end)
 
-local status =
-	Instance.new("TextLabel")
-
-status.Name = "Status"
-
-status.Size =
-	UDim2.new(
-		1,
-		-20,
-		0,
-		32
-	)
-
-status.Position =
-	UDim2.fromOffset(
-		10,
-		57
-	)
-
+-- status footer
+local status = Instance.new("TextLabel")
+status.Size                   = UDim2.new(1, 0, 0, 16)
 status.BackgroundTransparency = 1
+status.Font                   = Enum.Font.Code
+status.TextSize               = 10
+status.TextColor3             = Color3.fromRGB(120, 200, 140)
+status.TextXAlignment         = Enum.TextXAlignment.Left
+status.Text                   = "idle"
+status.Parent                 = body
 
-status.Text =
-	"● MONITORING"
+task.spawn(function()
+    while gui.Parent do
+        local _, dist = nearest(blockCache)
+        status.Text = string.format("blk:%d drp:%d near:%s",
+            #blockCache, #dropCache,
+            dist and string.format("%.0f", dist) or "-")
+        task.wait(1)
+    end
+end)
 
-status.TextColor3 =
-	Color3.fromRGB(
-		100,
-		255,
-		100
-	)
+-- minimize
+local expanded, fullSize = true, main.Size
+minBtn.MouseButton1Click:Connect(function()
+    expanded = not expanded
+    body.Visible = expanded
+    main.Size = expanded and fullSize or UDim2.fromOffset(fullSize.X.Offset, 34)
+    minBtn.Text = expanded and "–" or "+"
+end)
 
-status.Font =
-	Enum.Font.Code
-
-status.TextSize = 16
-
-status.TextXAlignment =
-	Enum.TextXAlignment.Left
-
-status.Parent =
-	frame
-
---==================================================
--- INFO
---==================================================
-
-local info =
-	Instance.new("TextLabel")
-
-info.Name = "Info"
-
-info.Size =
-	UDim2.new(
-		1,
-		-20,
-		0,
-		60
-	)
-
-info.Position =
-	UDim2.fromOffset(
-		10,
-		88
-	)
-
-info.BackgroundTransparency = 1
-
-info.TextColor3 =
-	Color3.fromRGB(
-		190,
-		190,
-		190
-	)
-
-info.Font =
-	Enum.Font.Code
-
-info.TextSize = 14
-
-info.TextXAlignment =
-	Enum.TextXAlignment.Left
-
-info.TextYAlignment =
-	Enum.TextYAlignment.Top
-
-info.Parent =
-	frame
-
---==================================================
--- SCROLLING EVENT LOG
---==================================================
-
-local scroll =
-	Instance.new("ScrollingFrame")
-
-scroll.Name =
-	"EventLog"
-
-scroll.Size =
-	UDim2.new(
-		1,
-		-20,
-		1,
-		-158
-	)
-
-scroll.Position =
-	UDim2.fromOffset(
-		10,
-		153
-	)
-
-scroll.BackgroundColor3 =
-	Color3.fromRGB(
-		3,
-		3,
-		3
-	)
-
-scroll.BackgroundTransparency =
-	0.1
-
-scroll.BorderSizePixel = 0
-
-scroll.ScrollBarThickness = 8
-
-scroll.ScrollBarImageColor3 =
-	Color3.fromRGB(
-		0,
-		255,
-		0
-	)
-
-scroll.ScrollingDirection =
-	Enum.ScrollingDirection.Y
-
-scroll.AutomaticCanvasSize =
-	Enum.AutomaticSize.Y
-
-scroll.CanvasSize =
-	UDim2.new(
-		0,
-		0,
-		0,
-		0
-	)
-
-scroll.Active = true
-
-scroll.Parent =
-	frame
-
-local scrollCorner =
-	Instance.new("UICorner")
-
-scrollCorner.CornerRadius =
-	UDim.new(
-		0,
-		10
-	)
-
-scrollCorner.Parent =
-	scroll
-
-local padding =
-	Instance.new("UIPadding")
-
-padding.PaddingTop =
-	UDim.new(
-		0,
-		8
-	)
-
-padding.PaddingBottom =
-	UDim.new(
-		0,
-		8
-	)
-
-padding.PaddingLeft =
-	UDim.new(
-		0,
-		8
-	)
-
-padding.PaddingRight =
-	UDim.new(
-		0,
-		8
-	)
-
-padding.Parent =
-	scroll
-
-local layout =
-	Instance.new("UIListLayout")
-
-layout.Padding =
-	UDim.new(
-		0,
-		3
-	)
-
-layout.SortOrder =
-	Enum.SortOrder.LayoutOrder
-
-layout.Parent =
-	scroll
-
---==================================================
--- EVENT STORAGE
---==================================================
-
-local eventLabels = {}
-local eventCounter = 0
-
---==================================================
--- TIMESTAMP
---==================================================
-
-local function timestamp()
-
-	return os.date(
-		"%H:%M:%S"
-	)
-
+-- drag
+do
+    local dragging, dragStart, startPos = false, nil, nil
+    bar.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1
+        or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, i.Position, main.Position
+            i.Changed:Connect(function()
+                if i.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
+        or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - dragStart
+            main.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end)
 end
 
---==================================================
--- ADD EVENT
---==================================================
-
-local function addEvent(
-	service,
-	eventType,
-	message
-)
-
-	eventCounter += 1
-
-	local text =
-		"[" ..
-		timestamp() ..
-		"] " ..
-		"[" ..
-		service ..
-		"] " ..
-		eventType ..
-		" | " ..
-		message
-
-	local label =
-		Instance.new("TextLabel")
-
-	label.Size =
-		UDim2.new(
-			1,
-			-4,
-			0,
-			24
-		)
-
-	label.BackgroundTransparency =
-		1
-
-	label.Text =
-		text
-
-	label.TextColor3 =
-		Color3.fromRGB(
-			200,
-			255,
-			200
-		)
-
-	label.Font =
-		Enum.Font.Code
-
-	label.TextSize = 13
-
-	label.TextXAlignment =
-		Enum.TextXAlignment.Left
-
-	label.TextWrapped = false
-
-	label.LayoutOrder =
-		eventCounter
-
-	label.Parent =
-		scroll
-
-	table.insert(
-		eventLabels,
-		label
-	)
-
-	if #eventLabels >
-		CONFIG.MaxLogs then
-
-		local old =
-			table.remove(
-				eventLabels,
-				1
-			)
-
-		if old then
-			old:Destroy()
-		end
-	end
-
-	task.defer(
-		function()
-
-			if scroll.Parent then
-
-				scroll.CanvasPosition =
-					Vector2.new(
-						0,
-						math.max(
-							0,
-							scroll.AbsoluteCanvasSize.Y
-								- scroll.AbsoluteWindowSize.Y
-						)
-					)
-
-			end
-
-		end
-	)
+--================================================================
+-- 12. CLEANUP
+--================================================================
+local function cleanup()
+    CONFIG.AutoKick, CONFIG.AutoCollect = false, false
+    CONFIG.AutoRebirth, CONFIG.AutoUpgrade = false, false
+    Spy.enabled = false
+    pcall(restorePos)
+    pcall(function() afkConn:Disconnect() end)
+    pcall(function() gui:Destroy() end)
+    if getgenv then getgenv().KALB_LOADED = false end
 end
 
---==================================================
--- INITIAL INFO
---==================================================
-
-info.Text =
-	"PlaceId : " ..
-	tostring(game.PlaceId) ..
-	"\nPlayer  : " ..
-	LocalPlayer.Name ..
-	"\nRemotes : " ..
-	tostring(#remoteResults) ..
-	"    Tools : " ..
-	tostring(#tools)
-
---==================================================
--- INITIAL EVENTS
---==================================================
-
-addEvent(
-	SERVICE.SYSTEM,
-	"INIT",
-	"Diagnostic client started"
-)
-
-addEvent(
-	SERVICE.PLAYER,
-	"PLAYER",
-	"Name=" ..
-	tostring(LocalPlayer.Name) ..
-	" UserId=" ..
-	tostring(LocalPlayer.UserId)
-)
-
-if humanoid then
-
-	addEvent(
-		SERVICE.CHARACTER,
-		"CHARACTER",
-		"Humanoid detected"
-	)
-
-	addEvent(
-		SERVICE.HEALTH,
-		"HEALTH",
-		tostring(
-			humanoid.Health
-		)
-		..
-		"/"
-		..
-		tostring(
-			humanoid.MaxHealth
-		)
-	)
-
-	addEvent(
-		SERVICE.MOVEMENT,
-		"CONFIG",
-		"WalkSpeed=" ..
-		tostring(
-			humanoid.WalkSpeed
-		)
-		..
-		" JumpPower=" ..
-		tostring(
-			humanoid.JumpPower
-		)
-	)
-end
-
---==================================================
--- REMOTE RESULTS
---==================================================
-
-for _, remote in ipairs(
-	remoteResults
-) do
-
-	addEvent(
-		SERVICE.REMOTE,
-		remote.Class,
-		remote.Path
-	)
-
-end
-
---==================================================
--- TOOL EVENTS
---==================================================
-
-local connectedTools = {}
-
-local function toolEquipped(tool)
-
-	if not tool then
-		return
-	end
-
-	addEvent(
-		SERVICE.TOOL,
-		"EQUIP",
-		tool.Name
-	)
-end
-
-local function toolUnequipped(tool)
-
-	if not tool then
-		return
-	end
-
-	addEvent(
-		SERVICE.TOOL,
-		"UNEQUIP",
-		tool.Name
-	)
-end
-
-local function connectTool(tool)
-
-	if not tool:IsA("Tool") then
-		return
-	end
-
-	if connectedTools[tool] then
-		return
-	end
-
-	connectedTools[tool] = true
-
-	tool.Equipped:Connect(
-		function()
-
-			toolEquipped(
-				tool
-			)
-
-		end
-	)
-
-	tool.Unequipped:Connect(
-		function()
-
-			toolUnequipped(
-				tool
-			)
-
-		end
-	)
-
-	tool.AncestryChanged:Connect(
-		function(_, parent)
-
-			if not parent then
-				connectedTools[tool] = nil
-			end
-
-		end
-	)
-end
-
---==================================================
--- BACKPACK MONITOR
---==================================================
-
-local backpack =
-	LocalPlayer:FindFirstChild(
-		"Backpack"
-	)
-
-if backpack then
-
-	for _, object in ipairs(
-		backpack:GetChildren()
-	) do
-
-		if object:IsA("Tool") then
-			connectTool(object)
-		end
-
-	end
-
-	backpack.ChildAdded:Connect(
-		function(object)
-
-			if object:IsA("Tool") then
-
-				connectTool(object)
-
-				addEvent(
-					SERVICE.TOOL,
-					"ADDED",
-					object.Name
-				)
-
-			end
-
-		end
-	)
-
-	backpack.ChildRemoved:Connect(
-		function(object)
-
-			if object:IsA("Tool") then
-
-				addEvent(
-					SERVICE.TOOL,
-					"BACKPACK REMOVE",
-					object.Name
-				)
-
-			end
-
-		end
-	)
-end
-
---==================================================
--- CHARACTER MONITOR
---==================================================
-
-local humanoidConnections = {}
-
-local function clearHumanoidConnections()
-
-	for _, connection in ipairs(
-		humanoidConnections
-	) do
-
-		if connection then
-			connection:Disconnect()
-		end
-
-	end
-
-	table.clear(
-		humanoidConnections
-	)
-end
-
-local function monitorCharacter(
-	newCharacter
-)
-
-	character = newCharacter
-
-	task.wait(
-		0.3
-	)
-
-	refreshCharacter()
-
-	addEvent(
-		SERVICE.CHARACTER,
-		"CHARACTER ADDED",
-		newCharacter.Name
-	)
-
-	if humanoid then
-
-		addEvent(
-			SERVICE.CHARACTER,
-			"HUMANOID",
-			"Detected"
-		)
-
-		addEvent(
-			SERVICE.HEALTH,
-			"INITIAL",
-			"HP=" ..
-			tostring(
-				math.floor(
-					humanoid.Health
-				)
-			)
-		)
-
-		addEvent(
-			SERVICE.MOVEMENT,
-			"INITIAL",
-			"WalkSpeed=" ..
-			tostring(
-				humanoid.WalkSpeed
-			)
-			..
-			" JumpPower=" ..
-			tostring(
-				humanoid.JumpPower
-			)
-		)
-
-		clearHumanoidConnections()
-
-		table.insert(
-			humanoidConnections,
-
-			humanoid:GetPropertyChangedSignal(
-				"WalkSpeed"
-			):Connect(
-				function()
-
-					addEvent(
-						SERVICE.MOVEMENT,
-						"WALKSPEED",
-						tostring(
-							humanoid.WalkSpeed
-						)
-					)
-
-				end
-			)
-		)
-
-		table.insert(
-			humanoidConnections,
-
-			humanoid:GetPropertyChangedSignal(
-				"JumpPower"
-			):Connect(
-				function()
-
-					addEvent(
-						SERVICE.MOVEMENT,
-						"JUMPPOWER",
-						tostring(
-							humanoid.JumpPower
-						)
-					)
-
-				end
-			)
-		)
-
-		table.insert(
-			humanoidConnections,
-
-			humanoid.HealthChanged:Connect(
-				function(newHealth)
-
-					addEvent(
-						SERVICE.HEALTH,
-						"CHANGED",
-						"HP -> " ..
-						tostring(
-							math.floor(
-								newHealth
-							)
-						)
-					)
-
-				end
-			)
-		)
-
-		table.insert(
-			humanoidConnections,
-
-			humanoid.StateChanged:Connect(
-				function(
-					oldState,
-					newState
-				)
-
-					if newState ==
-						Enum.HumanoidStateType.Jumping then
-
-						addEvent(
-							SERVICE.MOVEMENT,
-							"JUMP",
-							"State=Jumping"
-						)
-
-					elseif newState ==
-						Enum.HumanoidStateType.Freefall then
-
-						addEvent(
-							SERVICE.MOVEMENT,
-							"FALL",
-							"State=Freefall"
-						)
-
-					elseif newState ==
-						Enum.HumanoidStateType.Landed then
-
-						addEvent(
-							SERVICE.MOVEMENT,
-							"LAND",
-							"From=" ..
-							tostring(
-								oldState
-							)
-						)
-
-					elseif newState ==
-						Enum.HumanoidStateType.Dead then
-
-						addEvent(
-							SERVICE.HEALTH,
-							"DEAD",
-							"Humanoid died"
-						)
-
-					end
-
-				end
-			)
-		)
-	end
-
-	-- Existing character tools
-
-	for _, object in ipairs(
-		newCharacter:GetChildren()
-	) do
-
-		if object:IsA("Tool") then
-
-			connectTool(object)
-
-		end
-
-	end
-
-	-- Character additions
-
-	newCharacter.ChildAdded:Connect(
-		function(object)
-
-			if object:IsA("Tool") then
-
-				connectTool(
-					object
-				)
-
-				addEvent(
-					SERVICE.TOOL,
-					"CHARACTER ADD",
-					object.Name
-				)
-
-			else
-
-				addEvent(
-					SERVICE.CHARACTER,
-					"ADDED",
-					object.Name
-				)
-
-			end
-
-		end
-	)
-
-	-- Character removals
-
-	newCharacter.ChildRemoved:Connect(
-		function(object)
-
-			addEvent(
-				SERVICE.CHARACTER,
-				"REMOVED",
-				object.Name
-			)
-
-		end
-	)
-end
-
-LocalPlayer.CharacterAdded:Connect(
-	monitorCharacter
-)
-
---==================================================
--- INPUT MONITOR
---==================================================
-
-local function getInputName(
-	input
-)
-
-	if input.UserInputType ==
-		Enum.UserInputType.MouseButton1 then
-
-		return "MouseButton1"
-
-	elseif input.UserInputType ==
-		Enum.UserInputType.MouseButton2 then
-
-		return "MouseButton2"
-
-	elseif input.UserInputType ==
-		Enum.UserInputType.MouseButton3 then
-
-		return "MouseButton3"
-
-	elseif input.UserInputType ==
-		Enum.UserInputType.Touch then
-
-		return "Touch"
-
-	elseif input.KeyCode ~=
-		Enum.KeyCode.Unknown then
-
-		return tostring(
-			input.KeyCode
-		)
-
-	else
-
-		return tostring(
-			input.UserInputType
-		)
-
-	end
-end
-
-UserInputService.InputBegan:Connect(
-	function(
-		input,
-		processed
-	)
-
-		addEvent(
-			SERVICE.INPUT,
-			"DOWN",
-			getInputName(input)
-			..
-			" processed="
-			..
-			tostring(processed)
-		)
-
-	end
-)
-
-UserInputService.InputEnded:Connect(
-	function(
-		input,
-		processed
-	)
-
-		addEvent(
-			SERVICE.INPUT,
-			"UP",
-			getInputName(input)
-			..
-			" processed="
-			..
-			tostring(processed)
-		)
-
-	end
-)
-
---==================================================
--- POSITION MONITOR
---==================================================
-
-local lastPosition = nil
-local lastPositionLog = 0
-
-local function updatePosition()
-
-	if not rootPart then
-		return
-	end
-
-	local position =
-		rootPart.Position
-
-	if not lastPosition then
-
-		lastPosition =
-			position
-
-		return
-	end
-
-	local distance =
-		(position - lastPosition).Magnitude
-
-	local now =
-		os.clock()
-
-	if distance > 0.05
-		and now - lastPositionLog
-		>= CONFIG.PositionInterval then
-
-		lastPositionLog =
-			now
-
-		addEvent(
-			SERVICE.MOVEMENT,
-			"POSITION",
-			string.format(
-				"X=%.2f Y=%.2f Z=%.2f",
-				position.X,
-				position.Y,
-				position.Z
-			)
-		)
-
-		lastPosition =
-			position
-	end
-end
-
---==================================================
--- GUI STATUS LOOP
---==================================================
-
-local heartbeatConnection
-
-heartbeatConnection =
-	RunService.Heartbeat:Connect(
-		function()
-
-			if not gui.Parent then
-
-				if heartbeatConnection then
-					heartbeatConnection:Disconnect()
-				end
-
-				return
-			end
-
-			if humanoid then
-
-				status.Text =
-					"● MONITORING | HP "
-					..
-					math.floor(
-						humanoid.Health
-					)
-					..
-					"/"
-					..
-					math.floor(
-						humanoid.MaxHealth
-					)
-			end
-
-			updatePosition()
-
-		end
-	)
-
---==================================================
--- HIDE / SHOW
---==================================================
-
-closeButton.MouseButton1Click:Connect(
-	function()
-
-		frame.Visible = false
-
-		logoButton.Visible = true
-
-	end
-)
-
-logoButton.MouseButton1Click:Connect(
-	function()
-
-		frame.Visible = true
-
-		logoButton.Visible = false
-
-	end
-)
-
---==================================================
--- DRAG WINDOW - MOUSE + TOUCH
---==================================================
-
-local dragging = false
-local dragStart
-local startPosition
-
-local function updateDrag(
-	input
-)
-
-	local delta =
-		input.Position
-		- dragStart
-
-	frame.Position =
-		UDim2.new(
-			startPosition.X.Scale,
-			startPosition.X.Offset
-				+ delta.X,
-
-			startPosition.Y.Scale,
-			startPosition.Y.Offset
-				+ delta.Y
-		)
-end
-
-titleBar.InputBegan:Connect(
-	function(input)
-
-		if input.UserInputType ==
-			Enum.UserInputType.MouseButton1
-			or input.UserInputType ==
-			Enum.UserInputType.Touch then
-
-			dragging = true
-
-			dragStart =
-				input.Position
-
-			startPosition =
-				frame.Position
-
-		end
-
-	end
-)
-
-titleBar.InputEnded:Connect(
-	function(input)
-
-		if input.UserInputType ==
-			Enum.UserInputType.MouseButton1
-			or input.UserInputType ==
-			Enum.UserInputType.Touch then
-
-			dragging = false
-
-		end
-
-	end
-)
-
-UserInputService.InputChanged:Connect(
-	function(input)
-
-		if not dragging then
-			return
-		end
-
-		if input.UserInputType ==
-			Enum.UserInputType.MouseMovement
-			or input.UserInputType ==
-			Enum.UserInputType.Touch then
-
-			updateDrag(
-				input
-			)
-
-		end
-
-	end
-)
-
---==================================================
--- FINAL REPORT
---==================================================
-
-print("========================================")
-print("       FTP HUB DIAGNOSTIC READY")
-print("========================================")
-print("PlaceId :", game.PlaceId)
-print("Player  :", LocalPlayer.Name)
-print("Remotes :", #remoteResults)
-print("Tools   :", #tools)
-print("========================================")
-
---==================================================
--- WELCOME / AUTO HIDE
---==================================================
-
-task.delay(
-	CONFIG.WelcomeDuration,
-	function()
-
-		if gui and gui.Parent then
-
-			frame.Visible = false
-
-			logoButton.Visible = true
-
-		end
-
-	end
-)
+if getgenv then getgenv().KALB_CLEANUP = cleanup end
+closeBtn.MouseButton1Click:Connect(cleanup)
+
+-- toggle UI dengan RightShift
+UserInputService.InputBegan:Connect(function(i, gp)
+    if gp then return end
+    if i.KeyCode == Enum.KeyCode.RightShift then
+        gui.Enabled = not gui.Enabled
+    end
+end)
+
+notify("Loaded. RightShift = show/hide UI", 5)
+log("siap. kalau Auto Kick tidak jalan: pakai Remote Spy dulu.")
