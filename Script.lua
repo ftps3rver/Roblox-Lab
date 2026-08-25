@@ -1,88 +1,102 @@
 --[[
 ================================================================
-  KICK A LUCKY BLOCK — AUTO FARM HUB  (v1.0)
+  KICK A LUCKY BLOCK — AUTO FARM HUB  (v1.1 / loadstring build)
 ================================================================
-  Self-contained: tidak butuh library luar (Rayfield/Kavo dll).
-  Executor: Delta / Wave / Krnl / Synapse / Xeno (butuh
-            hookmetamethod + firetouchinterest untuk fitur penuh,
-            tapi tetap jalan tanpa itu dengan mode Teleport).
+  Build ini dirancang untuk dijalankan lewat:
 
-  CARA PAKAI SINGKAT:
-   1. Execute script ini di dalam game.
-   2. Klik tombol [SPY: OFF] -> jadi ON.
-   3. Kick 1 lucky block secara MANUAL.
-   4. Buka console executor (F9 / tombol Console).
-      Akan muncul baris: [SPY] Path:FireServer(args...)
-   5. Copy nama remote itu ke CONFIG.KickRemote di bawah,
-      lalu execute ulang. (Opsional — Auto Kick tetap bisa
-      jalan pakai fallback tanpa langkah ini.)
-   6. Nyalakan toggle yang mau dipakai.
+    loadstring(game:HttpGet("https://raw.githubusercontent.com/
+      <USERNAME>/<REPO>/main/KALB_Hub.lua"))()
+
+  Perubahan dari v1.0 agar aman dijalankan sebagai remote chunk:
+    * Tidak bergantung pada getgenv() untuk loop utama.
+      (v1.0 memakai `while getgenv and getgenv().KALB_LOADED` —
+       di executor tanpa getgenv, semua loop tidak pernah jalan.)
+    * Semua GetService dibungkus pcall (VirtualUser tidak ada
+      di sebagian environment).
+    * Guard anti-dobel-execute lebih ketat + cleanup penuh.
+    * Chunk mengembalikan tabel API, jadi bisa dipakai:
+        local Hub = loadstring(game:HttpGet(URL))()
+        Hub.Config.KickDelay = 0.3
+        Hub.Unload()
+    * Menunggu Character siap sebelum UI dibangun.
 ================================================================
 ]]
 
+local VERSION = "1.1"
+
 --================================================================
--- 0. GUARD (biar tidak dobel kalau di-execute 2x)
+-- 0. GUARD — unload instance lama sebelum load yang baru
 --================================================================
-if getgenv then
-    if getgenv().KALB_LOADED then
-        local old = getgenv().KALB_CLEANUP
-        if typeof(old) == "function" then pcall(old) end
-    end
-    getgenv().KALB_LOADED = true
+local ENV = (typeof(getgenv) == "function") and getgenv() or shared
+
+if ENV.KALB_LOADED then
+    local old = ENV.KALB_CLEANUP
+    if typeof(old) == "function" then pcall(old) end
+    task.wait(0.1)
+end
+ENV.KALB_LOADED = true
+ENV.KALB_VERSION = VERSION
+
+-- flag lokal: sumber kebenaran untuk semua loop (tidak butuh getgenv)
+local RUNNING = true
+--================================================================
+-- 1. SERVICES  (aman kalau ada service yang tidak tersedia)
+--================================================================
+local function svc(name)
+    local ok, s = pcall(game.GetService, game, name)
+    return ok and s or nil
 end
 
---================================================================
--- 1. SERVICES
---================================================================
-local Players            = game:GetService("Players")
-local ReplicatedStorage  = game:GetService("ReplicatedStorage")
-local Workspace          = game:GetService("Workspace")
-local RunService         = game:GetService("RunService")
-local UserInputService   = game:GetService("UserInputService")
-local VirtualUser        = game:GetService("VirtualUser")
-local StarterGui         = game:GetService("StarterGui")
+local Players           = svc("Players")
+local ReplicatedStorage = svc("ReplicatedStorage")
+local Workspace         = svc("Workspace") or workspace
+local UserInputService  = svc("UserInputService")
+local VirtualUser       = svc("VirtualUser")
+local StarterGui        = svc("StarterGui")
+local CoreGui           = svc("CoreGui")
 
-local LocalPlayer = Players.LocalPlayer
-
+local LocalPlayer = Players and Players.LocalPlayer
+if not LocalPlayer then
+    ENV.KALB_LOADED = false
+    error("[KALB] LocalPlayer tidak ditemukan — jalankan script di dalam game.", 0)
+end
 --================================================================
--- 2. CONFIG  <-- edit bagian ini
+-- 2. CONFIG
+--    Bisa di-override SEBELUM load lewat getgenv().KALB_CONFIG,
+--    atau sesudah load lewat Hub.Config.
 --================================================================
 local CONFIG = {
-    -- Toggle (bisa diubah dari UI juga)
     AutoKick        = false,
     AutoCollect     = false,
     AutoRebirth     = false,
     AutoUpgrade     = false,
     AntiAFK         = true,
-    NoClipFall      = true,   -- anti jatuh / anti void saat teleport
+    NoClipFall      = true,
 
-    -- Metode kick
-    UseTeleport     = true,   -- true = TP ke block, false = tetap di tempat
-    KickDelay       = 0.15,   -- jeda antar kick (detik). Jangan < 0.05
+    UseTeleport     = true,
+    KickDelay       = 0.15,
     CollectDelay    = 0.10,
     RebirthDelay    = 1.00,
     UpgradeDelay    = 0.50,
-    RescanInterval  = 3.00,   -- refresh daftar block (detik)
-    ScanRadius      = 500,    -- studs, 0 = tanpa batas
+    RescanInterval  = 3.00,
+    ScanRadius      = 500,
 
-    -- Nama remote (isi dari hasil SPY, kosongkan = pakai auto-detect)
-    KickRemote      = "",     -- contoh: "KickBlock"
-    RebirthRemote   = "",     -- contoh: "Rebirth"
-    UpgradeRemote   = "",     -- contoh: "BuyUpgrade"
+    KickRemote      = "",
+    RebirthRemote   = "",
+    UpgradeRemote   = "",
 
-    -- Argumen remote. Pakai "$BLOCK" sebagai placeholder instance block.
-    -- Contoh dari spy: FireServer(game.Workspace.Blocks.LuckyBlock)
-    --   -> KickArgs = { "$BLOCK" }
-    -- Contoh: FireServer("Kick", 1)  -> KickArgs = { "Kick", 1 }
     KickArgs        = { "$BLOCK" },
     RebirthArgs     = { },
-    UpgradeArgs     = { },    -- contoh: { "Power" }
+    UpgradeArgs     = { },
 
-    -- Kata kunci pencarian objek di Workspace
     BlockKeywords   = { "luckyblock", "lucky", "block", "crate", "box" },
     DropKeywords    = { "coin", "cash", "money", "gem", "drop", "orb", "pickup" },
 }
 
+-- merge override dari environment (dipakai loader)
+if typeof(ENV.KALB_CONFIG) == "table" then
+    for k, v in pairs(ENV.KALB_CONFIG) do CONFIG[k] = v end
+end
 --================================================================
 -- 3. UTIL
 --================================================================
@@ -95,24 +109,26 @@ local function log(...)
 end
 
 local function notify(text, dur)
-    pcall(function()
-        StarterGui:SetCore("SendNotification", {
-            Title    = "Kick a Lucky Block",
-            Text     = tostring(text),
-            Duration = dur or 3,
-        })
-    end)
+    if StarterGui then
+        pcall(function()
+            StarterGui:SetCore("SendNotification", {
+                Title    = "Kick a Lucky Block",
+                Text     = tostring(text),
+                Duration = dur or 3,
+            })
+        end)
+    end
     log(text)
 end
 
--- loop yang tidak mati kalau ada error
+-- loop yang tidak mati kalau body error; berhenti saat RUNNING = false
 local function loopTask(getEnabled, getDelay, body)
     task.spawn(function()
-        while getgenv and getgenv().KALB_LOADED do
+        while RUNNING do
             if getEnabled() then
                 local ok, err = pcall(body)
                 if not ok then log("err:", err) end
-                task.wait(getDelay())
+                task.wait(math.max(0.05, getDelay() or 0.1))
             else
                 task.wait(0.25)
             end
@@ -127,7 +143,6 @@ local function hasKeyword(name, list)
     end
     return false
 end
-
 --================================================================
 -- 4. CHARACTER HELPER
 --================================================================
@@ -165,15 +180,19 @@ end
 local function tpTo(cf)
     local hrp = getHRP()
     if not hrp then return false end
-    local hum = getHum()
-    if CONFIG.NoClipFall and hum then
-        hum:ChangeState(Enum.HumanoidStateType.Physics)
+    if CONFIG.NoClipFall then
+        local hum = getHum()
+        if hum then pcall(hum.ChangeState, hum, Enum.HumanoidStateType.Physics) end
     end
     hrp.CFrame = cf
-    hrp.AssemblyLinearVelocity = Vector3.zero
+    pcall(function() hrp.AssemblyLinearVelocity = Vector3.zero end)
     return true
 end
 
+-- reset state saat respawn supaya tidak restore ke posisi mati
+LocalPlayer.CharacterAdded:Connect(function()
+    savedCFrame = nil
+end)
 --================================================================
 -- 5. REMOTE INDEX + AUTO DETECT
 --================================================================
@@ -181,12 +200,14 @@ local function indexRemotes()
     local out = {}
     local roots = { ReplicatedStorage, LocalPlayer, Workspace }
     for _, root in ipairs(roots) do
-        local ok, desc = pcall(function() return root:GetDescendants() end)
-        if ok then
-            for _, obj in ipairs(desc) do
-                if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction")
-                or obj:IsA("UnreliableRemoteEvent") then
-                    out[#out + 1] = obj
+        if root then
+            local ok, desc = pcall(function() return root:GetDescendants() end)
+            if ok then
+                for _, obj in ipairs(desc) do
+                    if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction")
+                    or obj.ClassName == "UnreliableRemoteEvent" then
+                        out[#out + 1] = obj
+                    end
                 end
             end
         end
@@ -194,7 +215,6 @@ local function indexRemotes()
     return out
 end
 
--- cari remote: exact name dulu, kalau tidak ada baru fuzzy by keyword
 local function findRemote(exactName, keywords)
     local all = indexRemotes()
     if exactName and exactName ~= "" then
@@ -223,9 +243,9 @@ local function getRemote(slot, exactName, keywords)
     if r then log("remote[" .. slot .. "] =", r:GetFullName()) end
     return r
 end
-
 local function buildArgs(template, block)
     local args = {}
+    local n = 0
     for i, v in ipairs(template) do
         if v == "$BLOCK" then
             args[i] = block
@@ -234,26 +254,35 @@ local function buildArgs(template, block)
         else
             args[i] = v
         end
+        n = i
     end
-    return args
+    return args, n
 end
 
-local function fireRemote(remote, args)
+local function fireRemote(remote, args, count)
     if not remote then return false end
     local ok = pcall(function()
         if remote:IsA("RemoteFunction") then
-            remote:InvokeServer(table.unpack(args))
+            remote:InvokeServer(table.unpack(args, 1, count))
         else
-            remote:FireServer(table.unpack(args))
+            remote:FireServer(table.unpack(args, 1, count))
         end
     end)
     return ok
 end
-
 --================================================================
--- 6. REMOTE SPY (untuk menemukan nama remote yang benar)
+-- 6. REMOTE SPY — untuk menemukan nama remote & argumen aslinya
 --================================================================
 local Spy = { enabled = false, seen = {}, hooked = false }
+
+-- checkcaller tidak ada di semua executor
+local function fromOurScript()
+    if typeof(checkcaller) == "function" then
+        local ok, res = pcall(checkcaller)
+        return ok and res or false
+    end
+    return false
+end
 
 local function fmtArgs(...)
     local out = {}
@@ -261,7 +290,7 @@ local function fmtArgs(...)
         local v = select(i, ...)
         local t = typeof(v)
         if t == "Instance" then
-            out[#out + 1] = v:GetFullName()
+            out[#out + 1] = "game." .. v:GetFullName()
         elseif t == "string" then
             out[#out + 1] = '"' .. v .. '"'
         elseif t == "table" then
@@ -275,13 +304,13 @@ end
 
 local function initSpy()
     if Spy.hooked then return true end
-    if not (hookmetamethod and getnamecallmethod) then
+    if typeof(hookmetamethod) ~= "function" or typeof(getnamecallmethod) ~= "function" then
         notify("Executor tidak support hookmetamethod — Spy nonaktif")
         return false
     end
     local oldNamecall
     oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-        if Spy.enabled then
+        if Spy.enabled and not fromOurScript() then
             local method = getnamecallmethod()
             if method == "FireServer" or method == "InvokeServer" then
                 local ok, path = pcall(function() return self:GetFullName() end)
@@ -299,9 +328,8 @@ local function initSpy()
     Spy.hooked = true
     return true
 end
-
 --================================================================
--- 7. TARGET FINDER (lucky block & drop)
+-- 7. TARGET FINDER
 --================================================================
 local blockCache, dropCache = {}, {}
 
@@ -322,7 +350,6 @@ local function primaryOf(obj)
     return nil
 end
 
--- scan Workspace, ambil yang match keyword & masih hidup
 local function scanTargets()
     local blocks, drops = {}, {}
     local ok, desc = pcall(function() return Workspace:GetDescendants() end)
@@ -334,7 +361,6 @@ local function scanTargets()
         and not (char and obj:IsDescendantOf(char))
         and not Players:GetPlayerFromCharacter(obj) then
             if hasKeyword(obj.Name, CONFIG.BlockKeywords) then
-                -- skip kalau ini child dari block lain yang sudah dicatat
                 if primaryOf(obj) then blocks[#blocks + 1] = obj end
             elseif hasKeyword(obj.Name, CONFIG.DropKeywords) then
                 if primaryOf(obj) then drops[#drops + 1] = obj end
@@ -344,6 +370,11 @@ local function scanTargets()
     return blocks, drops
 end
 
+local function rescan()
+    local ok, b, d = pcall(scanTargets)
+    if ok then blockCache, dropCache = b, d end
+    return blockCache, dropCache
+end
 local function nearest(list)
     local hrp = getHRP()
     if not hrp then return nil end
@@ -360,24 +391,24 @@ local function nearest(list)
             end
         end
     end
+    if not best then return nil end
     return best, bestDist
 end
 
--- refresh cache di background
+-- background rescan
 task.spawn(function()
-    while getgenv and getgenv().KALB_LOADED do
-        local ok, b, d = pcall(scanTargets)
-        if ok then blockCache, dropCache = b, d end
-        task.wait(CONFIG.RescanInterval)
+    while RUNNING do
+        rescan()
+        task.wait(math.max(0.5, CONFIG.RescanInterval))
     end
 end)
-
 --================================================================
 -- 8. AKSI
 --================================================================
 local function tryTouch(targetPart)
     local hrp = getHRP()
-    if not (hrp and targetPart and firetouchinterest) then return false end
+    if not (hrp and targetPart) then return false end
+    if typeof(firetouchinterest) ~= "function" then return false end
     local ok = pcall(function()
         firetouchinterest(hrp, targetPart, 0)
         task.wait()
@@ -387,10 +418,10 @@ local function tryTouch(targetPart)
 end
 
 local function tryPrompt(obj)
-    if not fireproximityprompt then return false end
+    if typeof(fireproximityprompt) ~= "function" then return false end
     local prompt = obj:FindFirstChildWhichIsA("ProximityPrompt", true)
     if not prompt then return false end
-    return pcall(function() fireproximityprompt(prompt) end)
+    return (pcall(fireproximityprompt, prompt))
 end
 
 -- Urutan usaha: Remote -> ProximityPrompt -> Touch -> Teleport
@@ -400,8 +431,9 @@ local function kickBlock(block)
 
     local remote = getRemote("kick", CONFIG.KickRemote,
         { "kick", "hitblock", "punch", "damageblock", "clickblock" })
-    if remote and fireRemote(remote, buildArgs(CONFIG.KickArgs, block)) then
-        return true
+    if remote then
+        local args, n = buildArgs(CONFIG.KickArgs, block)
+        if fireRemote(remote, args, n) then return true end
     end
 
     if tryPrompt(block) then return true end
@@ -416,7 +448,6 @@ local function kickBlock(block)
     end
     return false
 end
-
 local function collectDrop(drop)
     if not (drop and drop.Parent) then return false end
     local part = primaryOf(drop)
@@ -434,16 +465,17 @@ end
 
 local function doRebirth()
     local remote = getRemote("rebirth", CONFIG.RebirthRemote,
-        { "rebirth", "prestige", "reset", "ascend" })
-    return fireRemote(remote, buildArgs(CONFIG.RebirthArgs, nil))
+        { "rebirth", "prestige", "ascend" })
+    local args, n = buildArgs(CONFIG.RebirthArgs, nil)
+    return fireRemote(remote, args, n)
 end
 
 local function doUpgrade()
     local remote = getRemote("upgrade", CONFIG.UpgradeRemote,
         { "upgrade", "buyupgrade", "buy", "purchase", "kickpower", "power" })
-    return fireRemote(remote, buildArgs(CONFIG.UpgradeArgs, nil))
+    local args, n = buildArgs(CONFIG.UpgradeArgs, nil)
+    return fireRemote(remote, args, n)
 end
-
 --================================================================
 -- 9. LOOPS
 --================================================================
@@ -455,9 +487,7 @@ loopTask(
         if block then
             kickBlock(block)
         else
-            -- cache kosong: paksa rescan cepat
-            local ok, b, d = pcall(scanTargets)
-            if ok then blockCache, dropCache = b, d end
+            rescan()
         end
     end
 )
@@ -483,27 +513,29 @@ loopTask(
     doUpgrade
 )
 
--- balikin posisi kalau semua auto dimatikan
+-- balikin posisi kalau semua auto sudah dimatikan
 task.spawn(function()
-    while getgenv and getgenv().KALB_LOADED do
+    while RUNNING do
         if not (CONFIG.AutoKick or CONFIG.AutoCollect) and savedCFrame then
             restorePos()
         end
         task.wait(1)
     end
 end)
-
 --================================================================
 -- 10. ANTI-AFK
 --================================================================
-local afkConn = LocalPlayer.Idled:Connect(function()
-    if not CONFIG.AntiAFK then return end
-    pcall(function()
-        VirtualUser:CaptureController()
-        VirtualUser:ClickButton2(Vector2.new())
-    end)
-end)
+local conns = {}
 
+if VirtualUser then
+    conns[#conns + 1] = LocalPlayer.Idled:Connect(function()
+        if not CONFIG.AntiAFK then return end
+        pcall(function()
+            VirtualUser:CaptureController()
+            VirtualUser:ClickButton2(Vector2.new())
+        end)
+    end)
+end
 --================================================================
 -- 11. UI
 --================================================================
@@ -523,14 +555,26 @@ local function round(inst, px)
     return c
 end
 
-local gui = Instance.new("ScreenGui")
-gui.Name             = "KALB_Hub"
-gui.ResetOnSpawn     = false
-gui.IgnoreGuiInset   = true
-gui.ZIndexBehavior   = Enum.ZIndexBehavior.Sibling
-gui.Parent = (gethui and gethui()) or game:GetService("CoreGui")
-if syn and syn.protect_gui then pcall(syn.protect_gui, gui) end
+-- parent GUI paling aman yang tersedia
+local function guiParent()
+    if typeof(gethui) == "function" then
+        local ok, h = pcall(gethui)
+        if ok and h then return h end
+    end
+    if CoreGui then return CoreGui end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
 
+local gui = Instance.new("ScreenGui")
+gui.Name           = "KALB_Hub"
+gui.ResetOnSpawn   = false
+gui.IgnoreGuiInset = true
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.DisplayOrder   = 9999
+gui.Parent         = guiParent()
+
+if typeof(protectgui) == "function" then pcall(protectgui, gui) end
+if syn and syn.protect_gui then pcall(syn.protect_gui, gui) end
 local main = Instance.new("Frame")
 main.Size             = UDim2.fromOffset(260, 372)
 main.Position         = UDim2.new(0, 24, 0.5, -186)
@@ -541,9 +585,9 @@ main.Parent           = gui
 round(main, 10)
 
 local stroke = Instance.new("UIStroke")
-stroke.Color        = Color3.fromRGB(60, 60, 75)
-stroke.Thickness     = 1
-stroke.Parent        = main
+stroke.Color     = Color3.fromRGB(60, 60, 75)
+stroke.Thickness = 1
+stroke.Parent    = main
 
 local bar = Instance.new("Frame")
 bar.Size             = UDim2.new(1, 0, 0, 34)
@@ -553,28 +597,27 @@ bar.Parent           = main
 round(bar, 10)
 
 local title = Instance.new("TextLabel")
-title.Size                = UDim2.new(1, -70, 1, 0)
-title.Position            = UDim2.fromOffset(12, 0)
+title.Size                   = UDim2.new(1, -70, 1, 0)
+title.Position               = UDim2.fromOffset(12, 0)
 title.BackgroundTransparency = 1
-title.Font                = Enum.Font.GothamBold
-title.TextSize            = 13
-title.TextColor3          = COL.text
-title.TextXAlignment      = Enum.TextXAlignment.Left
-title.Text                = "Lucky Block · Auto"
-title.Parent              = bar
+title.Font                   = Enum.Font.GothamBold
+title.TextSize               = 13
+title.TextColor3             = COL.text
+title.TextXAlignment         = Enum.TextXAlignment.Left
+title.Text                   = "Lucky Block · Auto  v" .. VERSION
+title.Parent                 = bar
 
 local minBtn = Instance.new("TextButton")
-minBtn.Size                = UDim2.fromOffset(28, 22)
-minBtn.Position            = UDim2.new(1, -64, 0, 6)
-minBtn.BackgroundColor3    = COL.off
-minBtn.BorderSizePixel     = 0
-minBtn.Font                = Enum.Font.GothamBold
-minBtn.TextSize            = 14
-minBtn.TextColor3          = COL.text
-minBtn.Text                = "–"
-minBtn.Parent              = bar
+minBtn.Size             = UDim2.fromOffset(28, 22)
+minBtn.Position         = UDim2.new(1, -64, 0, 6)
+minBtn.BackgroundColor3 = COL.off
+minBtn.BorderSizePixel  = 0
+minBtn.Font             = Enum.Font.GothamBold
+minBtn.TextSize         = 14
+minBtn.TextColor3       = COL.text
+minBtn.Text             = "–"
+minBtn.Parent           = bar
 round(minBtn, 5)
-
 local closeBtn = Instance.new("TextButton")
 closeBtn.Size             = UDim2.fromOffset(28, 22)
 closeBtn.Position         = UDim2.new(1, -32, 0, 6)
@@ -588,20 +631,19 @@ closeBtn.Parent           = bar
 round(closeBtn, 5)
 
 local body = Instance.new("ScrollingFrame")
-body.Size                 = UDim2.new(1, -16, 1, -46)
-body.Position             = UDim2.fromOffset(8, 40)
+body.Size                   = UDim2.new(1, -16, 1, -46)
+body.Position               = UDim2.fromOffset(8, 40)
 body.BackgroundTransparency = 1
-body.BorderSizePixel      = 0
-body.ScrollBarThickness   = 3
-body.CanvasSize           = UDim2.new()
-body.AutomaticCanvasSize  = Enum.AutomaticSize.Y
-body.Parent               = main
+body.BorderSizePixel        = 0
+body.ScrollBarThickness     = 3
+body.CanvasSize             = UDim2.new()
+body.AutomaticCanvasSize    = Enum.AutomaticSize.Y
+body.Parent                 = main
 
 local list = Instance.new("UIListLayout")
-list.Padding             = UDim.new(0, 6)
-list.SortOrder           = Enum.SortOrder.LayoutOrder
-list.Parent              = body
-
+list.Padding   = UDim.new(0, 6)
+list.SortOrder = Enum.SortOrder.LayoutOrder
+list.Parent    = body
 local function addToggle(label, key, onChange)
     local btn = Instance.new("TextButton")
     btn.Size             = UDim2.new(1, 0, 0, 30)
@@ -638,48 +680,62 @@ local function addButton(label, fn)
     return btn
 end
 
-local function addSlider(label, key, min, max, step)
+local function addLabel(text)
+    local lb = Instance.new("TextLabel")
+    lb.Size                   = UDim2.new(1, 0, 0, 18)
+    lb.BackgroundTransparency = 1
+    lb.Font                   = Enum.Font.GothamBold
+    lb.TextSize               = 10
+    lb.TextColor3             = Color3.fromRGB(140, 140, 160)
+    lb.TextXAlignment         = Enum.TextXAlignment.Left
+    lb.Text                   = string.upper(text)
+    lb.Parent                 = body
+    return lb
+end
+local function addSlider(label, key, min, max, step, fmt)
+    fmt = fmt or "%.2f"
     local holder = Instance.new("Frame")
-    holder.Size                 = UDim2.new(1, 0, 0, 40)
-    holder.BackgroundColor3     = COL.off
-    holder.BorderSizePixel      = 0
-    holder.Parent               = body
+    holder.Size             = UDim2.new(1, 0, 0, 40)
+    holder.BackgroundColor3 = COL.off
+    holder.BorderSizePixel  = 0
+    holder.Parent           = body
     round(holder, 6)
 
     local txt = Instance.new("TextLabel")
-    txt.Size                    = UDim2.new(1, -12, 0, 16)
-    txt.Position                = UDim2.fromOffset(8, 3)
-    txt.BackgroundTransparency  = 1
-    txt.Font                    = Enum.Font.Gotham
-    txt.TextSize                = 11
-    txt.TextColor3              = COL.text
-    txt.TextXAlignment          = Enum.TextXAlignment.Left
-    txt.Text                    = string.format("%s: %.2f", label, CONFIG[key])
-    txt.Parent                  = holder
+    txt.Size                   = UDim2.new(1, -12, 0, 16)
+    txt.Position               = UDim2.fromOffset(8, 3)
+    txt.BackgroundTransparency = 1
+    txt.Font                   = Enum.Font.Gotham
+    txt.TextSize               = 11
+    txt.TextColor3             = COL.text
+    txt.TextXAlignment         = Enum.TextXAlignment.Left
+    txt.Text                   = string.format("%s: " .. fmt, label, CONFIG[key])
+    txt.Parent                 = holder
 
     local track = Instance.new("Frame")
-    track.Size                  = UDim2.new(1, -16, 0, 6)
-    track.Position              = UDim2.fromOffset(8, 24)
-    track.BackgroundColor3      = Color3.fromRGB(70, 70, 84)
-    track.BorderSizePixel       = 0
-    track.Parent                = holder
+    track.Size             = UDim2.new(1, -16, 0, 6)
+    track.Position         = UDim2.fromOffset(8, 24)
+    track.BackgroundColor3 = Color3.fromRGB(70, 70, 84)
+    track.BorderSizePixel  = 0
+    track.Parent           = holder
     round(track, 3)
 
     local fill = Instance.new("Frame")
-    fill.Size                   = UDim2.fromScale((CONFIG[key] - min) / (max - min), 1)
-    fill.BackgroundColor3       = COL.accent
-    fill.BorderSizePixel        = 0
-    fill.Parent                 = track
+    fill.Size             = UDim2.fromScale(math.clamp((CONFIG[key] - min) / (max - min), 0, 1), 1)
+    fill.BackgroundColor3 = COL.accent
+    fill.BorderSizePixel  = 0
+    fill.Parent           = track
     round(fill, 3)
-
     local sliding = false
     local function setFromX(x)
+        if track.AbsoluteSize.X <= 0 then return end
         local rel = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
         local val = min + rel * (max - min)
         val = math.floor(val / step + 0.5) * step
+        val = math.clamp(val, min, max)
         CONFIG[key] = val
         fill.Size = UDim2.fromScale((val - min) / (max - min), 1)
-        txt.Text = string.format("%s: %.2f", label, val)
+        txt.Text = string.format("%s: " .. fmt, label, val)
     end
 
     track.InputBegan:Connect(function(i)
@@ -689,31 +745,19 @@ local function addSlider(label, key, min, max, step)
             setFromX(i.Position.X)
         end
     end)
-    UserInputService.InputEnded:Connect(function(i)
+    conns[#conns + 1] = UserInputService.InputEnded:Connect(function(i)
         if i.UserInputType == Enum.UserInputType.MouseButton1
         or i.UserInputType == Enum.UserInputType.Touch then
             sliding = false
         end
     end)
-    UserInputService.InputChanged:Connect(function(i)
+    conns[#conns + 1] = UserInputService.InputChanged:Connect(function(i)
         if sliding and (i.UserInputType == Enum.UserInputType.MouseMovement
         or i.UserInputType == Enum.UserInputType.Touch) then
             setFromX(i.Position.X)
         end
     end)
-end
-
-local function addLabel(text)
-    local lb = Instance.new("TextLabel")
-    lb.Size                    = UDim2.new(1, 0, 0, 18)
-    lb.BackgroundTransparency  = 1
-    lb.Font                    = Enum.Font.GothamBold
-    lb.TextSize                = 10
-    lb.TextColor3              = Color3.fromRGB(140, 140, 160)
-    lb.TextXAlignment          = Enum.TextXAlignment.Left
-    lb.Text                    = string.upper(text)
-    lb.Parent                  = body
-    return lb
+    return holder
 end
 
 -- ==== isi UI ====
@@ -727,8 +771,8 @@ addLabel("Setting")
 addToggle("Teleport Mode", "UseTeleport")
 addToggle("Anti AFK", "AntiAFK")
 addSlider("Kick Delay", "KickDelay", 0.05, 1.0, 0.05)
-addSlider("Scan Radius", "ScanRadius", 0, 1000, 50)
-
+addSlider("Collect Delay", "CollectDelay", 0.05, 1.0, 0.05)
+addSlider("Scan Radius", "ScanRadius", 0, 1000, 50, "%.0f")
 addLabel("Tools")
 local spyBtn
 spyBtn = addButton("Remote Spy : OFF", function()
@@ -751,7 +795,6 @@ addButton("List Semua Remote", function()
     for _, r in ipairs(all) do log(" •", r.ClassName, r:GetFullName()) end
     notify(#all .. " remote di-print ke console")
 end)
-
 addButton("List Target Terdeteksi", function()
     local b, d = scanTargets()
     log("=== blocks:", #b, "| drops:", #d, "===")
@@ -766,8 +809,7 @@ end)
 addButton("Kick Sekali (test)", function()
     local block = nearest(blockCache)
     if not block then
-        local ok, bb = pcall(scanTargets)
-        if ok then blockCache = bb end
+        rescan()
         block = nearest(blockCache)
     end
     if block then
@@ -782,7 +824,6 @@ addButton("Balik ke Posisi Awal", function()
     restorePos()
     notify("posisi direstore")
 end)
-
 -- status footer
 local status = Instance.new("TextLabel")
 status.Size                   = UDim2.new(1, 0, 0, 16)
@@ -795,7 +836,7 @@ status.Text                   = "idle"
 status.Parent                 = body
 
 task.spawn(function()
-    while gui.Parent do
+    while RUNNING and gui.Parent do
         local _, dist = nearest(blockCache)
         status.Text = string.format("blk:%d drp:%d near:%s",
             #blockCache, #dropCache,
@@ -812,8 +853,7 @@ minBtn.MouseButton1Click:Connect(function()
     main.Size = expanded and fullSize or UDim2.fromOffset(fullSize.X.Offset, 34)
     minBtn.Text = expanded and "–" or "+"
 end)
-
--- drag
+-- drag window
 do
     local dragging, dragStart, startPos = false, nil, nil
     bar.InputBegan:Connect(function(i)
@@ -825,7 +865,7 @@ do
             end)
         end
     end)
-    UserInputService.InputChanged:Connect(function(i)
+    conns[#conns + 1] = UserInputService.InputChanged:Connect(function(i)
         if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement
         or i.UserInputType == Enum.UserInputType.Touch) then
             local d = i.Position - dragStart
@@ -835,30 +875,60 @@ do
         end
     end)
 end
-
 --================================================================
 -- 12. CLEANUP
 --================================================================
 local function cleanup()
+    RUNNING = false
     CONFIG.AutoKick, CONFIG.AutoCollect = false, false
     CONFIG.AutoRebirth, CONFIG.AutoUpgrade = false, false
     Spy.enabled = false
     pcall(restorePos)
-    pcall(function() afkConn:Disconnect() end)
+    for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+    conns = {}
     pcall(function() gui:Destroy() end)
-    if getgenv then getgenv().KALB_LOADED = false end
+    ENV.KALB_LOADED = false
+    log("unloaded.")
 end
 
-if getgenv then getgenv().KALB_CLEANUP = cleanup end
+ENV.KALB_CLEANUP = cleanup
 closeBtn.MouseButton1Click:Connect(cleanup)
 
--- toggle UI dengan RightShift
-UserInputService.InputBegan:Connect(function(i, gp)
+-- RightShift = show/hide UI
+conns[#conns + 1] = UserInputService.InputBegan:Connect(function(i, gp)
     if gp then return end
     if i.KeyCode == Enum.KeyCode.RightShift then
         gui.Enabled = not gui.Enabled
     end
 end)
-
-notify("Loaded. RightShift = show/hide UI", 5)
+--================================================================
+-- 13. API RETURN  (dipakai kalau di-load lewat loadstring)
+--================================================================
+notify("Loaded v" .. VERSION .. ". RightShift = show/hide UI", 5)
 log("siap. kalau Auto Kick tidak jalan: pakai Remote Spy dulu.")
+
+local Hub = {
+    Version   = VERSION,
+    Config    = CONFIG,
+    Gui       = gui,
+    Unload    = cleanup,
+    Rescan    = rescan,
+    Kick      = kickBlock,
+    Collect   = collectDrop,
+    Rebirth   = doRebirth,
+    Upgrade   = doUpgrade,
+    Remotes   = indexRemotes,
+    Targets   = scanTargets,
+    Nearest   = nearest,
+    SetSpy    = function(on)
+        if on then
+            if not initSpy() then return false end
+            Spy.seen = {}
+        end
+        Spy.enabled = on and true or false
+        return true
+    end,
+}
+
+ENV.KALB = Hub
+return Hub
